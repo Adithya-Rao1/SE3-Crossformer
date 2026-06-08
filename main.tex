@@ -1,14 +1,85 @@
 \documentclass{article}
 \usepackage{graphicx} % Required for inserting images
+\usepackage{amsmath, amsfonts, amssymb}
 
-\title{Research_Project_1}
-\author{}
-\date{May 2026}
+\title{Graph Attention for Vibrational Spectra Prediction}
+\author{Adithya Rao, Xu Liang}
+\date{June 2026}
 
 \begin{document}
 
-\maketitle
+\maketitle{}
 
 \section{Introduction}
+Creating an SE(3)-equivariant attention-based graph nerual network.
+
+\section{Problem Statement + Motivation}
+This work is originally inspired by the success of the SE(3) transformer. The primary goal of this work is to predict vibrational spectra of molecules. The SE(3) transformer includes a self attention term and attention between each node within a neighborhood. Neighborhoods are created using a traditional N-nearest neighbors algorithm. We believe in the molecular domain, this effectively models short-term Coulombic attractions (intra-neighborhood) and electrostatic self potentials, but fails to effectively consider the long-range interactions. 
+
+\section{Proposed Solution}
+Thus, we propose adding an inter-neighborhood attention term that aggregates neighborhood feature representations and uses SE(3) equivariant EGNN (which acts as an MPNN) to relay this information to contribute to the update of each node feature vector. 
+
+\subsection{Methodology}
+We begin by defining a graph $\mathcal{G} = \{\mathcal{V}, \mathcal{E}\}$ where $\mathcal{V}$ denotes the set of nodes and $\mathcal{E}$ the set of edges. Each node $i$ and edge $ij$ will have with them an associated set of node and edge features $\mathbf{f}_i$. We seek to then predict properties of the graph by predicting these features. The local nodes will be the 3D coordinates of each atom. The local edges will be the one-hot encoded bonds between an atom $i$ and atom $j$ for all atoms $j \in \mathcal{N}_i$. Then, the feature vector of node and edge features will live in the d-dimensional real Euclidean space  such that $\mathbf{f}_i \in \mathbb{R}^d$ Neighborhoods will be constructed using the spectral graph decomposition algorithm outlined in the paper by Elden. Suppose this process yields $k$ subgraphs. For each node $i \in \mathcal{N}_j, \quad j \in \{1, \dots, k\}$, we calculate the feature update using the original mechanism proposed in the SE(3)-Transformer paper so that:
+\[
+\mathbf{f}_{\text{out},i}^\ell = \mathbf{W}_V^{\ell \ell}\mathbf{f}_{\text{in},i}^\ell + \sum_{k \geq 0} \sum_{j \in \mathcal{N}_i \backslash i} \alpha_{ij} \mathbf{W}_V^{\ell k}(\mathbf{x}_j -\mathbf{x}_i)\mathbf{f}_{\text{in},j}^k
+\]
+\noindent
+We do this for all nodes in the subgraph. Then, we construct a learnable message of the subgraph $i$ as the following:
+\[
+\mathbf{m}_{\text{out},i}^\ell =\mathbf{W}^{\ell \ell}_V \mathbf{m}_{\text{in}, i} + \sum_{k \geq 0} \sum_{j \in \mathcal{C}_i \backslash i} \beta_{ij}\mathbf{W}^{\ell k}_V(\mathbf{x}_{\text{CM}, j } - \mathbf{x}_{\text{CM}, i})\mathbf{m}_{\text{in},i}^\ell
+\]
+\noindent 
+where 
+\[
+\mathbf{x}_{\text{CM}, b} = \frac{\sum_{i=1}^{N_b} m_i\mathbf{x}_i}{\sum_{i=1}^{N_b} m_i}
+\quad \mathbf{m}_{\text{in}, i}^{\ell=1} = \frac{1}{N_{\mathcal{N}_i}} \sum_{i \in \mathcal{N}_i}\mathbf{f}_{\text{out},i}^{\ell = 1}
+\]
+\noindent 
+$m_i$ is the atomic mass of atom $i$, and $\mathcal{C}_j \backslash j$ is the set of all neighborhood except the $j$-th one. Therefore, we define the inter-neighborhood graph edges as the distances connecting the center of masses of each neighborhood. The motivation behind this is to give stronger weight to the neighborhood messages that are closer to some node $i$ in subgraph $j$ since long-range chemical and electrical interactions fall off with distances. Furthermore, similar to the learnable weight matrices, $\mathbf{m_i}$ will be a $(2J + 1) \times (2J + 1)$ matrix that will be decomoposed into a the product of the corresponding Clebsch-Gordan coefficients times the direct sum of the orthonormal spherical harmonics functions evaluated at $\mathbf{x_i}$ for $\mathbf{m}_i$ to preserve equivariance once it acts on the feature vectors. Then, consider subgraph $i$, we update each node $i \in \mathcal{N}_i$ by the following:
+\[
+\mathbf{f}_{\text{out}, i}^\ell = \mathbf{f}_{\text{out}, i}^\ell + \sum_{a \geq 0} \sum_{b \in \mathcal{C}_i \backslash i} \gamma_{ij} \mathbf{m}_b(\mathbf{x}_{\text{CM},b} - \mathbf{x}_i)\mathbf{f}_{\text{out}, i}^\ell
+\]
+\noindent
+In the equations above, there are 3 sets of attention weights $\alpha_{ij}, \beta_{ij}, \gamma_{ij}$ which represents the information correspondence of feature-feature, neighborhood-neighborhood, and neighborhood-feature, respectively. Thus, they are constructed as follows:
+\begin{align}
+    \alpha_{ij} &= \frac{\exp(\mathbf{q}_i^T\mathbf{k}_{ij})}{\sum_{j \in \mathcal{N}_i \backslash i} \exp(\mathbf{q}_i^T\mathbf{k}_{ij})}, \quad \mathbf{q}_i = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_Q^{\ell k} \mathbf{f}_{\text{in},i}^k, \quad \mathbf{k}_{ij} = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_K^{\ell k}(\mathbf{x}_j - \mathbf{x}_i) \mathbf{f}_{\text{in},j}^k \notag \\
+    \beta_{ij} &= \frac{\exp(\mathbf{q}_{m,i}^T\mathbf{k}_{m,ij})}{\sum_{j \in \mathcal{C}_i \backslash i} \exp(\mathbf{q}_{m,i}^T\mathbf{k}_{m, ij})}, \quad \mathbf{q}_i = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_Q^{\ell k} \mathbf{m}_{\text{in},i}^k, \quad \mathbf{k}_{ij} = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_K^{\ell k}(\mathbf{x}_{\text{CM},j} - \mathbf{x}_{\text{CM},i}) \mathbf{m}_{\text{in},j}^k \notag \\
+    \gamma_{ij} &= \frac{\exp(\mathbf{q}_{i}^T\mathbf{k}_{m, ij})}{\sum_{j \in \mathcal{C}_i \backslash i} \exp(\mathbf{q}_{i}^T\mathbf{k}_{m, ij})}, \quad \mathbf{q}_i = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_Q^{\ell k} \mathbf{f}_{\text{in},i}^k, \quad \mathbf{k}_{ij} = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_K^{\ell k}(\mathbf{x}_{\text{CM},j} - \mathbf{x}_{\text{CM},i}) \mathbf{m}_{\text{in},j}^k \notag \\
+\end{align}
+
+Next, to ensure the learnable weight matrices $\mathbf{W}$ maintain equivariance when acting upon the $SO(3)$-transformed feature vectors $\mathbf{f}$, they must satisfy
+\begin{align}
+\mathbf{W}^{\ell k}(\mathbf{x}) &= \text{unvec}\Big( \mathbf{Q}^{\ell k \text{T}} \bigoplus_{J = |k-\ell|}^{k + \ell} \phi_J^{\ell k}(||\mathbf{x}||)\mathbf{Y}_J(\mathbf{x}) \Big) \notag
+\\
+&= \sum_{J = |k-\ell|}^{k + \ell} \phi_J^{\ell k}(||\mathbf{x}||)\text{unvec}\big( \mathbf{Q}^{\ell k \text{T}}\mathbf{Y}_J(\mathbf{x}) \big) \notag
+\end{align}
+
+\noindent
+Thus, our contribution is the 3rd term of the update mechanism which factors in long-range geometric and chemical interactions without being too computationally intensive. 
+\subsubsection{Spectral Graph Partitioning '\&' Extending Neighborhood Radius}
+Most works in the literature use a form of nearest neighbors approach to create subgraphs for nodes. However, we believe that k-NN graph approaches destroy important molecular topological data, such as functional groups. As such, crucial inductive biases are removed from the model which have been shown to potentially improve model performance. Intuitively, this is because these spatial arrangements often have larger impacts on the forces/potentials between molecules but are rarely considered in works such as the SE(3)-Transformer. Thus, we adopt a multiway spectral graph partitioning scheme by Elden. Herein, we believe that this will lead to better conservation of implicit molecular topologies and thus improve the results of the attention mechanism. Another possible refutal of our methodology is through arguing that long range effects can be considered using self-attention with an extended neighborhood radius in the subgraph creation algorithm. To this we argue that extending the neighborhood radius only accounts for atom-atom interactions. However, it fails to consider the chemical effects induced by spatial orientations of groups of graphs. This is seen in the behavior of functional groups which greatly impact the chemical properties and reactivity of molecules. Furthermore, functional group effects can vary depending on proximity to other functional groups. Thus, we better capture these behaviors by conducting spectral graph partitioning and attaining neighborhood level messages to run self-attention on.
+
+\section{Expected Improvements}
+As seen in the SE(3)-Transformer paper, the model performs fairly poorly when evaluated on QM9 regression task dataset. We expect an improvement in these predictions since polarizability, energy levels, and heat capacities are all global quantum mechanical/electronic properties that will benefit from the added inductive bias of the extra potential term. Furthermore, as noted in the HD-NNP paper, when using ML-MD methods to predict IR spectra, the predictions often deviate significantly from those generated by ab-initio MD methods at frequency regions greater than $3000 \mathrm{cm}^{-1}$. The authors of the HD-NNP attribute this to the inability of ML-based methods to accurately model C-H bond stretching which is highly sensitive to orbital hybridization, and exhibits symmetric or antisymmetric motion depending on the geometry.
+
+\section{Next Steps}
+\noindent Thus, need to define the following:
+\begin{enumerate}
+  \item LARGEST GAP: SE(3) transformer works in the static regime of 3D molecular conformations. But, we are using MD trajectories to predict vibrational spectra so we have dynamic information with a time-dependent component. 
+  \item How information gets broadcast/propagated back to atoms 
+  \item If subgraphs kept constant, we might miss some nodes were included in KNN approach while adding some node interactions that were only included in spectral graph approach --> Need to figure out if there is some information loss
+  \item Need to justify the construction of $\mathbf{m}_i$ using physical inductive biases/chemical representations 
+\end{enumerate}
+
+\section{Experiments at this stage}
+\subsection{Verifying graph partitioning claims}
+Using the ZINC-250K dataset, we will sample 100 molecules. For each molecule, we will use RDKit to extract the boundaries of each meaningful substructure/functional group. Then, we will run graph partitioning using the k-graph spectral decomposition approach and kNN approach. The distances between boundaries will be calculated to evaluate the differences in topologies. Then, the differences between the set of distances between method 1 and the reference boundaries and method 2 and the reference boundaries will be used to conduct a $95\%$ confidence interval of a difference of means. If 0 is not contained within the interval, we will have established that the spectral decomposition method yields a noticeable improvement in graph partitioning while accounting for inherent molecular topologies.
+
+\subsection{Initial regression task}
+We will train our model on the QM9 dataset to initially predict static regression values. Then, $95\%$ confidence intervals will be constructed across 5 trials to get the mean predictions of model. These will be compared with the values calculated by SE(3)-transformer and LieConv. 
+
+\subsection{Predicting vibrational spectra (static vs dynamic formulation)}
+The next experiment will be calculating the IR spectra. To do so, we will train the model to predict the time derivative of the dipole moment and run an FFT to get the IR spectra. Since our model is currently operating in the static domain (i.e. we only consider 1 frame of a molecule instead of the full MD trajectory), we do not suspect the best results on this. However, further experiments will be conducted by generalizing our model to include time components using spatio-temporal graph attention frameworks. 
 
 \end{document}
