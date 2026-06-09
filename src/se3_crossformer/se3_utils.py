@@ -304,12 +304,13 @@ def direct_sum_inner_product(
 
 
 def softmax_over_neighbors(
-    scores: torch.Tensor,       # [N, num_neighbors]
-    mask: torch.Tensor = None,  # [N, num_neighbors] bool, True = valid
+    scores: torch.Tensor,       # [..., num_neighbors]
+    mask: torch.Tensor = None,  # [..., num_neighbors] bool, True = valid
 ) -> torch.Tensor:
     """
-    Masked softmax along the neighbor dimension.
+    Masked softmax along the neighbor dimension (last dim).
     """
     if mask is not None:
-        scores = scores.masked_fill(~mask.unsqueeze(-1), float("-inf"))
-    return F.softmax(scores, dim=-1)
+        scores = scores.masked_fill(~mask, float("-inf"))
+    attn = F.softmax(scores, dim=-1)
+    return torch.nan_to_num(attn, nan=0.0)

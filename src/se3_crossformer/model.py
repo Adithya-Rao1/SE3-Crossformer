@@ -113,7 +113,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
             self_term = self.W_V_self_intra[str(l)](f_in[l])   # [N, 2l+1]
 
             Wf_j = Wf_j_flat[l].view(N, K, C, 2 * l + 1)         # [N, K, C, 2l+1]
-            alpha_exp = alpha.unsqueeze(-1)                      # [N, K, C, 1]
+            alpha_exp = alpha.unsqueeze(-1).unsqueeze(-1)                    # [N, K, 1, 1]
             neighbor_term = (alpha_exp * Wf_j).sum(dim=1)       # [N, C, 2l+1]
 
             f_out[l] = self_term + neighbor_term
@@ -156,7 +156,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
             self_term = self.W_V_self_msg[str(l)](m_in[l])     # [S, 2l+1]
 
             Wm_j = Wm_j_flat[l].view(S, S, C, 2 * l + 1)         # [S, S, C, 2l+1]
-            beta_exp = beta.unsqueeze(-1)                        # [S, S, C, 1]
+            beta_exp = beta.unsqueeze(-1).unsqueeze(-1)                      # [S, S, 1, 1]
             neighbor_term = (beta_exp * Wm_j).sum(dim=1)        # [S, C, 2l+1]
 
             m_out[l] = self_term + neighbor_term
@@ -235,7 +235,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
                     # [N, 2l+1, 2k+1] @ [N, C, 2k+1] -> [N, C, 2l+1]
                     Wf = torch.einsum("nij,ncj->nci", W_b, f_k)
 
-                    cross_contrib = cross_contrib + gamma[:, b].unsqueeze(-1) * Wf
+                    cross_contrib = cross_contrib + gamma[:, b].unsqueeze(-1).unsqueeze(-1) * Wf
 
             # Residual addition + layer-norm for training stability
             f_updated[l] = self.layer_norm[str(l)](feat + cross_contrib)

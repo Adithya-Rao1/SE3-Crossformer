@@ -113,7 +113,8 @@ class IntraNeighborhoodAttention(nn.Module):
         k = {l: k[l].view(N, K, C, 2 * l + 1) for l in k}
 
         q_expanded = {l: q[l].unsqueeze(1) for l in q.keys()}
-        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, K]
+        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, K, C]
+        scores = scores.sum(dim=-1)                                      # [N, K]
 
         return softmax_over_neighbors(scores, neighbor_mask)             # [N, K]
 
@@ -152,7 +153,8 @@ class InterNeighborhoodAttention(nn.Module):
         k = {l: k[l].view(S, S, C, 2 * l + 1) for l in k}
 
         q_expanded = {l: q[l].unsqueeze(1).expand(S, S, C, 2 * l + 1) for l in q}
-        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [S, S]
+        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [S, S, C]
+        scores = scores.sum(dim=-1)                                      # [S, S]
 
         return softmax_over_neighbors(scores, subgraph_mask)
 
@@ -196,7 +198,8 @@ class CrossAttention(nn.Module):
         k = {l: k[l].view(N, S, C, 2 * l + 1) for l in k}
 
         q_expanded = {l: q[l].unsqueeze(1).expand(N, S, C, 2 * l + 1) for l in q}
-        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, S]
+        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, S, C]
+        scores = scores.sum(dim=-1)                                      # [N, S]
 
         # Mask: node i must not attend to its own subgraph.
         # own_subgraph[i, s] = True  iff node i belongs to subgraph s.
