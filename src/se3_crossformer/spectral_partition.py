@@ -59,16 +59,19 @@ def spectral_partition(
     """
     L = build_laplacian(edge_index, num_nodes, edge_weight, normalized_laplacian)
 
-    eigenvalues, eigenvectors = torch.linalg.eigh(L.cpu())   # [N], [N, N]
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(L.cpu())   # [N], [N, N]
+    
+        # Skip the trivial eigenvector (index 0, eigenvalue ~0)
+        embedding1 = eigenvectors[:, 1 : num_parts + 1]           # [N, num_parts]
 
-    # Skip the trivial eigenvector (index 0, eigenvalue ~0)
-    embedding = eigenvectors[:, 1 : num_parts + 1]           # [N, num_parts]
+        norms = embedding1.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        embedding = embedding1 / norms                             # [N, num_parts]
 
-    norms = embedding.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    embedding = embedding / norms                             # [N, num_parts]
-
-    # TODO: Replace with Elden-specific clustering.
-    node_to_subgraph = _kmeans_cluster(embedding.numpy(), num_parts)
+        # TODO: Replace with Elden-specific clustering.
+        node_to_subgraph = _kmeans_cluster(embedding.numpy(), num_parts)
+    except Exception as e:
+        print("Spectral partition error: ", e)
 
     return torch.tensor(node_to_subgraph, dtype=torch.long)
 

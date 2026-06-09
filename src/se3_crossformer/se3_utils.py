@@ -1,16 +1,3 @@
-"""
-se3_utils.py
-------------
-SE(3)-equivariant utilities: spherical harmonics, Clebsch-Gordan coefficients,
-and the equivariant weight matrix W^{lk}(x).
-
-NOTE TO AUTHOR:
-    Several functions below are stubs marked with # TODO. These require either:
-      - A validated CG coefficient library (e2e, e3nn, or hand-rolled)
-      - Numerical spherical harmonic evaluations consistent with your convention
-    Please fill these in before running any forward passes.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

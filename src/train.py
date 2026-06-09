@@ -87,10 +87,12 @@ def load_qm9(target_idx: int, batch_size=32, root: str = "./data"):
 
 
     # Shuffle and split
+    idx1 = 110000
+    idx2 = 120000
     perm = torch.randperm(len(dataset))
-    train_dataset = dataset[perm[:110000]]
-    val_dataset   = dataset[perm[110000:120000]]
-    test_dataset  = dataset[perm[120000:]]
+    train_dataset = dataset[perm[:idx1]]
+    val_dataset   = dataset[perm[idx1:idx2]]
+    test_dataset  = dataset[perm[idx2:]]
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=2)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2)
@@ -117,7 +119,7 @@ def one_hot_z(z: torch.Tensor) -> torch.Tensor:
 # Training utilities
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, num_parts, device):
     model.train()
     total_loss = 0.0
     for i, batch in enumerate(loader):
@@ -129,7 +131,7 @@ def train_epoch(model, loader, optimizer, device):
         x            = batch.pos.to(device)                    # [N, 3]
         edge_index   = batch.edge_index.to(device)             # [2, E]
         atomic_mass  = get_atomic_masses(batch.x).to(device)  # [N]
-        target       = batch.y.to(device)                      # [N_graphs, 1]
+        target       = batch.y.to(device)                      # [N_graphs, 19]
         # print(batch.y.shape)
 
         # TODO: The current model.forward handles a single graph (no batch dim).
@@ -139,6 +141,11 @@ def train_epoch(model, loader, optimizer, device):
         ptr = batch.ptr  # [B+1] graph boundary indices
         for g in range(len(ptr) - 1):
             nf   = node_feat[ptr[g]:ptr[g+1]]
+            if nf.shape[0] < num_parts: # Prevent n_samples < n_subgraphs for k-means clustering
+                mask = torch.arange(target.shape[0]) != g
+                target = target[mask]
+                target = target.view(-1, 19)
+                continue
             pos  = x[ptr[g]:ptr[g+1]]
             mass = atomic_mass[ptr[g]:ptr[g+1]]
             # Re-index edges to be local to the graph
@@ -159,11 +166,11 @@ def train_epoch(model, loader, optimizer, device):
 
         print(f"Batch {i+1} Loss: {loss.item()}")
 
-    return total_loss / len(loader.dataset)
+    return total_loss / len(loader)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, num_parts, device):
     model.eval()
     total_mae = 0.0
     for batch in loader:
@@ -178,6 +185,11 @@ def evaluate(model, loader, device):
         preds = []
         for g in range(len(ptr) - 1):
             nf   = node_feat[ptr[g]:ptr[g+1]]
+            if nf.shape[0] < num_parts: # Prevent n_samples < n_subgraphs for k-means clustering
+                mask = torch.arange(target.shape[0]) != g
+                target = target[mask]
+                target = target.view(-1, 19)
+                continue
             pos  = x[ptr[g]:ptr[g+1]]
             mass = atomic_mass[ptr[g]:ptr[g+1]]
             local_ei = edge_index[:, (edge_index[0] >= ptr[g]) & (edge_index[0] < ptr[g+1])]
@@ -188,7 +200,7 @@ def evaluate(model, loader, device):
         pred_batch = torch.stack(preds)
         total_mae += nn.functional.l1_loss(pred_batch, target).item()
 
-    return total_mae / len(loader.dataset)
+    return total_mae / len(loader)
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +266,8 @@ def main():
 
         best_val_mae = float("inf")
         for epoch in range(1, args.epochs + 1):
-            train_loss = train_epoch(model, train_loader, optimizer, device)
-            val_mae    = evaluate(model, val_loader, device)
+            train_loss = train_epoch(model, train_loader, optimizer, args.num_parts, device)
+            val_mae    = evaluate(model, val_loader, args.num_parts, device)
             scheduler.step()
 
             if val_mae < best_val_mae:

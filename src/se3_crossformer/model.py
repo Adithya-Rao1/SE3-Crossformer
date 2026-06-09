@@ -366,6 +366,8 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         edge_index: torch.Tensor,         # [2, E]
         atomic_masses: torch.Tensor,      # [N]
     ) -> torch.Tensor:
+        
+        # print("Node features shape: ", node_features.shape)
         N = node_features.shape[0]
 
         h0 = self.input_embedding(node_features).unsqueeze(-1)   # [N, feature_dim]
