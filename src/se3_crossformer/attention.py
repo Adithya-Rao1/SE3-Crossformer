@@ -10,6 +10,15 @@ from src.se3_crossformer.se3_utils import (
     softmax_over_neighbors,
 )
 
+class EquivariantLinear(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(cout, cin))
+
+    def forward(self, x):
+        # x: [N, Cin, 2l+1]
+        return torch.einsum("oc,ncm->nom", self.weight, x)
+
 class QKProjection(nn.Module):
     def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int, batch_size=32):
         """
@@ -22,30 +31,48 @@ class QKProjection(nn.Module):
         super().__init__()
         self.max_degree = max_degree
         self.W_Q = nn.ModuleDict({
-            str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
+            str(l): EquivariantLinear(cin=feature_dim, cout=feature_dim)
             for l in range(max_degree + 1)
         })
 
-        self.W_K_nets = nn.ModuleDict()   # unused placeholder (see radial_K)
         self.radial_K: Dict[str, nn.ModuleDict] = nn.ModuleDict()
 
         for l in range(max_degree + 1):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 j_nets = nn.ModuleDict({
-                    str(J): RadialNetwork(hidden_dim=hidden_dim)
+                    str(J): RadialNetwork(num_basis=2*l+1, hidden_dim=hidden_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
                 self.radial_K[key] = j_nets
 
     # ------------------------------------------------------------------
     def query(self, f: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+        # Fixed query vector formation by adding a direct sum
+
         q: Dict[int, torch.Tensor] = {}
+
         for l in range(self.max_degree + 1):
             if l not in f:
                 continue
 
-            q[l] = self.W_Q[str(l)](f[l])   # [..., 2l+1]
+            any_k = next(iter(f.values()))
+            C = any_k.shape[-2]
+
+            q[l] = torch.zeros(
+                f[l].shape,
+                device=f[l].device,
+                dtype=f[l].dtype
+            )
+
+            for k in range(self.max_degree + 1):
+                if k not in f:
+                    continue
+
+                key = f"{l}_{k}"
+
+                q[l] = q[l] + self.W_Q[str(l)](f[l])   # [..., 2l+1]
+
         return q
 
     def key(
@@ -56,7 +83,6 @@ class QKProjection(nn.Module):
         return apply_direct_sum_W(
             f=f,
             x=x_rel,
-            weight_nets=self.W_K_nets,   # unused inside apply_direct_sum_W
             radial_nets=self.radial_K,   # {f"{l}_{k}": {J: RadialNetwork}}
             max_degree=self.max_degree,
         )
@@ -105,15 +131,16 @@ class IntraNeighborhoodAttention(nn.Module):
                 N*K,
                 C,
                 2*l+1
-            )
+            ) for l in f_in
         }
         x_rel_flat = x_rel.reshape(N * K, 3)
 
         k = self.qk.key(f_j_flat, x_rel_flat)            # {l: [N*K, 2l+1]}
-        k = {l: k[l].view(N, K, C, 2 * l + 1) for l in k}
+        k = {l: k[l].reshape(N, K, C, 2*l+1, 2*l+1) for l in k}
 
-        q_expanded = {l: q[l].unsqueeze(1) for l in q.keys()}
-        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, K, C]
+        print([k[l].shape for l in q.keys()])
+        print([q[l].shape for l in q.keys()])
+        scores = direct_sum_inner_product(q, k) / self.scale   # [N, K, C]
         scores = scores.sum(dim=-1)                                      # [N, K]
 
         return softmax_over_neighbors(scores, neighbor_mask)             # [N, K]

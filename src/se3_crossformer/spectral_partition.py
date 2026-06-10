@@ -112,7 +112,6 @@ def subgraph_center_of_mass(
 
     return x_cm
 
-
 def initial_message(
     f_out: Dict,                       # {degree: [N, 2l+1]}  post-intra-attention features
     node_to_subgraph: torch.Tensor,    # [N]
@@ -123,8 +122,8 @@ def initial_message(
           for all degrees or only l=1, and whether mean-pooling is the right
           aggregation (max, sum, attention-pool are alternatives).
     """
-    from typing import Dict as D
-    m: D = {}
+    m: Dict = {}
+
     for l, feat in f_out.items():                   # feat: [N, C, 2l+1]
         m_l = torch.zeros(num_subgraphs, feat.shape[-2], feat.shape[-1], device=feat.device, dtype=feat.dtype)
         counts = torch.zeros(num_subgraphs, device=feat.device, dtype=feat.dtype)

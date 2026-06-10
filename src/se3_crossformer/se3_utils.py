@@ -50,7 +50,7 @@ def find_kth_sph_root(order, k, thresh=1e-8):
                 interval_end = c
             else:
                 interval_begin = c # root in [c, init_end]
-                    
+        print("Found root!")
     return c
 
 def spherical_bessel_first_kind(
@@ -138,38 +138,46 @@ def equivariant_weight_matrix(
     device, dtype = x.device, x.dtype
  
     r = x.norm(dim=-1).clamp(min=1e-8)   # [...], scalar distance
- 
+    
+    # print(f"l: {l}, k: {k}, J from {abs(l-k)} to {l + k + 1}")
     cg = clebsch_gordan_matrix(l, k)      # {J: [(2l+1)(2k+1), 2J+1]}
  
     W = torch.zeros(*batch_shape, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype) # [N, 2l+1, 2k+1]
+    # print("W shape: ", W.shape)
  
     for J, Q_J in cg.items():
         # Q_J: [(2l+1)(2k+1), 2J+1], move to correct device/dtype
         Q_J = Q_J.to(device=device, dtype=dtype)
+        # print("Q_J shape: ", Q_J.shape)
  
         # Y_J(x): [..., 2J+1]
         alphas, betas = x_to_alpha_beta(x)
         Y_J = []
         for alpha, beta in zip(alphas, betas):
             Y_J.append(spherical_harmonics(J, alpha, beta))
-        Y_J = torch.tensor(Y_J, device=device).unsqueeze(-1)
+        
+        # print("Y_J length: ", len(Y_J))
+        # print("Shape of Y_J first element: ", Y_J[0].shape)
+        Y_J = torch.stack(Y_J, dim=0)
+        # print("Y_J shape: ", Y_J.shape)
 
-        phi_J = radial_fns[J](r)          # [N]
+        phi_J = radial_fns[str(J)](r, l, k)         # [N, 1]
+        # print("phi_j shape: ", phi_J.shape)
  
         # Q_J^T @ Y_J  ->  [..., (2l+1)(2k+1)]
         # Y_J: [..., 2J+1], Q_J.T: [2J+1, (2l+1)(2k+1)]
         # einsum: 'ji,...i->...j'  with j = (2l+1)(2k+1), i = 2J+1
         QTY = torch.einsum("ji,...i->...j", Q_J, Y_J)   # [..., (2l+1)(2k+1)]
+        # print("QTY shape: ", QTY.shape)
  
         # Reshape to [..., 2l+1, 2k+1] and weight by phi_J
-        QTY_mat = QTY.view(-1, 2 * l + 1, 2 * k + 1)
-
-        W = W + phi_J.unsqueeze(-1).unsqueeze(-1) * QTY_mat
+        had_prod = phi_J * QTY
+        W = W + had_prod.view(-1, 2*l+1, 2*k+1)
  
     return W
  
 class RadialNetwork(nn.Module):
-    def __init__(self, num_basis: int = 8, hidden_dim: int = 32):
+    def __init__(self, num_basis: int, hidden_dim: int = 32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(num_basis, hidden_dim),
@@ -179,7 +187,6 @@ class RadialNetwork(nn.Module):
         self.num_basis = num_basis
  
     def _basis(self, r: torch.Tensor, order: int, k:int, cutoff_radius=3.0) -> torch.Tensor:
-        # TODO: Verify basis choice aligns with the rest of the architecture.
         bases = []
 
         for ord in range(-order, order + 1):
@@ -195,19 +202,21 @@ class RadialNetwork(nn.Module):
                 2.0 / ((cutoff_radius ** 3) * (sph_bes_denom ** 2) * kth_root + 1e-12)
             ) ** 0.5
 
-            e_sbf = (norm_factor * sph_bes_r).unsqueeze(0).unsqueeze(-1).expand(1, -1, 3)
+            e_sbf = (norm_factor * sph_bes_r)
             bases.append(e_sbf)
         
-        return torch.stack(bases, dim=0).squeeze(0)
+        return torch.stack(bases, dim=0).reshape(-1, 1)
  
-    def forward(self, r: torch.Tensor) -> torch.Tensor:
+    def forward(self, r: torch.Tensor, order: int, k: int) -> torch.Tensor:
         """r: [...], returns scalar [...] """
-        return self.net(self._basis(r)).squeeze(-1)
+        # print("Bases shape: ", self._basis(r, order, k).shape)
+        out = self.net(self._basis(r, order, k).reshape(-1, 2*order+1))
+        # print("radial out shape: ", out.shape)
+        return out
  
 def apply_direct_sum_W(
     f: Dict[int, torch.Tensor],
     x: torch.Tensor,
-    weight_nets: nn.ModuleDict,
     radial_nets: nn.ModuleDict,
     max_degree: int,
 ) -> Dict[int, torch.Tensor]:
@@ -227,12 +236,13 @@ def apply_direct_sum_W(
         )
 
         for k in range(max_degree + 1):
-            if k not in f:
-                continue
+            # print(f.keys())
+            # if k not in f:
+            #     continue
 
             key = f"{l}_{k}"
-            if key not in weight_nets:
-                continue
+            # if key not in weight_nets:
+            #     continue
 
             W = equivariant_weight_matrix(x, l, k, radial_nets[key])
             # W: [..., 2l+1, 2k+1]
@@ -240,10 +250,41 @@ def apply_direct_sum_W(
 
             # bring channels into einsum explicitly
             # result: [..., C, 2l+1]
-            out[l] = out[l] + torch.einsum("...ij,...cj->...ci", W, f[k])
+            # print("W shape: ", W.shape)
+            contrib = torch.einsum("...ij,...cj->...ci", W, f[k])
+            # print("Einsum shape: ", contrib.shape)
+            out[l] = out[l] + contrib
 
     return out
-  
+
+def direct_sum_inner_product(
+    a: Dict[int, torch.Tensor],
+    b: Dict[int, torch.Tensor],
+) -> torch.Tensor:
+    result = None
+    for l in a:
+        if l not in b:
+            print("l not in b")
+            continue
+        dot = (a[l] * b[l]).sum(dim=-1)  # [...]
+        print("dot shape: ", dot.shape)
+        result = dot if result is None else result + dot
+    if result is None:
+        raise ValueError("No shared degrees between query and key.")
+    return result
+
+def softmax_over_neighbors(
+    scores: torch.Tensor,       # [..., num_neighbors]
+    mask: torch.Tensor = None,  # [..., num_neighbors] bool, True = valid
+) -> torch.Tensor:
+    """
+    Masked softmax along the neighbor dimension (last dim).
+    """
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    attn = F.softmax(scores, dim=-1)
+    return torch.nan_to_num(attn, nan=0.0)
+
 def verify_cg_orthogonality(max_degree: int = 2, tol: float = 1e-5) -> None:
     print("Verifying CG matrix orthogonality...")
     all_ok = True
@@ -273,31 +314,3 @@ def verify_cg_orthogonality(max_degree: int = 2, tol: float = 1e-5) -> None:
             "One or more CG matrices failed the orthogonality check. "
             "Check sympy version and CG coefficient indexing."
         )
-
-def direct_sum_inner_product(
-    a: Dict[int, torch.Tensor],
-    b: Dict[int, torch.Tensor],
-) -> torch.Tensor:
-    result = None
-    for l in a:
-        if l not in b:
-            print("l not in b")
-            continue
-        dot = (a[l] * b[l]).sum(dim=-1)  # [...]
-        result = dot if result is None else result + dot
-    if result is None:
-        raise ValueError("No shared degrees between query and key.")
-    return result
-
-
-def softmax_over_neighbors(
-    scores: torch.Tensor,       # [..., num_neighbors]
-    mask: torch.Tensor = None,  # [..., num_neighbors] bool, True = valid
-) -> torch.Tensor:
-    """
-    Masked softmax along the neighbor dimension (last dim).
-    """
-    if mask is not None:
-        scores = scores.masked_fill(~mask, float("-inf"))
-    attn = F.softmax(scores, dim=-1)
-    return torch.nan_to_num(attn, nan=0.0)
