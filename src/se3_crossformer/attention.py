@@ -138,9 +138,11 @@ class IntraNeighborhoodAttention(nn.Module):
         k = self.qk.key(f_j_flat, x_rel_flat)            # {l: [N*K, 2l+1]}
         k = {l: k[l].reshape(N, K, C, 2*l+1) for l in k}
 
-        print([k[l].shape for l in q.keys()])
-        print([q[l].shape for l in q.keys()])
-        scores = direct_sum_inner_product(q, k) / self.scale   # [N, K, C]
+        q_expanded = {l: q[l].unsqueeze(1) for l in q.keys()}
+
+        # print([k[l].shape for l in q.keys()])
+        # print([q_expanded[l].shape for l in q.keys()])
+        scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, K, C]
         scores = scores.sum(dim=-1)                                      # [N, K]
 
         return softmax_over_neighbors(scores, neighbor_mask)             # [N, K]

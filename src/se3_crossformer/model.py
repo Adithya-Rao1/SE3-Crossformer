@@ -212,11 +212,11 @@ class SE3InterNeighborhoodLayer(nn.Module):
                         def __init__(self, val):
                             super().__init__()
                             self._val = val
-                        def forward(self, r):
+                        def forward(self, r, degree, k):
                             # r: [N]; return [N] precomputed phi
                             return self._val
 
-                    radial_b = {J: _FixedRadial(phi_b[J]) for J in phi_b}
+                    radial_b = {str(J): _FixedRadial(phi_b[J]) for J in phi_b}
 
                     # W^{lk}(x_rel_b): [N, 2l+1, 2k+1]
                     W_b = equivariant_weight_matrix(

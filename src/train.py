@@ -55,7 +55,7 @@ def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def load_qm9(target_idx: int, batch_size=32, root: str = "./data"):
+def load_qm9(target_idx: int, batch_size=4, root: str = "./data"):
     """
     Load QM9 dataset via torch_geometric.
 
@@ -157,6 +157,8 @@ def train_epoch(model, loader, optimizer, num_parts, device):
         pred_batch = torch.stack(preds).squeeze(-1)   # [B]
         # print("pred_batch shape: ", pred_batch.shape)
         # print("target shape: ", target.shape)
+        print("Pred batch: ", pred_batch)
+        print("Targets: ", target.squeeze(-1))
         loss = nn.functional.l1_loss(pred_batch, target.squeeze(-1))
 
         optimizer.zero_grad()
@@ -228,7 +230,7 @@ def main():
     parser.add_argument("--target",     type=int,   default=1,   help="QM9 target index (0-11)")
     parser.add_argument("--num_parts",  type=int,   default=4,   help="Number of spectral subgraphs")
     parser.add_argument("--max_degree", type=int,   default=2,   help="Max SE(3) irrep degree")
-    parser.add_argument("--batch_size", type=int,   default=16)
+    parser.add_argument("--batch_size", type=int,   default=4)
     parser.add_argument("--num_layers", type=int,   default=4)
     parser.add_argument("--feature_dim",type=int,   default=32)
     parser.add_argument("--hidden_dim", type=int,   default=64)

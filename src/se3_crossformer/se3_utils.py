@@ -184,6 +184,8 @@ def equivariant_weight_matrix(
         # print("Y_J shape: ", Y_J.shape)
 
         phi_J = radial_fns[str(J)](r, l, k)         # [N, 1]
+        if phi_J.ndim == 1:
+            phi_J = phi_J.unsqueeze(-1)
         # print("phi_j shape: ", phi_J.shape)
  
         # Q_J^T @ Y_J  ->  [..., (2l+1)(2k+1)]
@@ -194,6 +196,10 @@ def equivariant_weight_matrix(
  
         # Reshape to [..., 2l+1, 2k+1] and weight by phi_J
         had_prod = phi_J * QTY
+
+        # print("W shape: ", W.shape)
+        # print("had prob pre view shape: ", had_prod.shape)
+        # print("had prod post view shape: ", had_prod.view(-1, 2*l+1, 2*k+1).shape)
         W = W + had_prod.view(-1, 2*l+1, 2*k+1)
  
     return W
@@ -292,7 +298,7 @@ def direct_sum_inner_product(
             print("l not in b")
             continue
         dot = (a[l] * b[l]).sum(dim=-1)  # [...]
-        print("dot shape: ", dot.shape)
+        # print("dot shape: ", dot.shape)
         result = dot if result is None else result + dot
     if result is None:
         raise ValueError("No shared degrees between query and key.")
