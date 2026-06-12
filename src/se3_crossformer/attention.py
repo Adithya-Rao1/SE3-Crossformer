@@ -136,7 +136,7 @@ class IntraNeighborhoodAttention(nn.Module):
         x_rel_flat = x_rel.reshape(N * K, 3)
 
         k = self.qk.key(f_j_flat, x_rel_flat)            # {l: [N*K, 2l+1]}
-        k = {l: k[l].reshape(N, K, C, 2*l+1, 2*l+1) for l in k}
+        k = {l: k[l].reshape(N, K, C, 2*l+1) for l in k}
 
         print([k[l].shape for l in q.keys()])
         print([q[l].shape for l in q.keys()])

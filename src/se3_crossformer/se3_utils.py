@@ -9,6 +9,18 @@ from src.se3_crossformer.irr_rep import *
 from scipy.special import jv
 import math
 
+"""
+Root problem seems to be for
+
+order = -2
+k = 0
+
+Problem: For order n \in [-1, 1], the j_n(x) spherical bessel function of the first kind has closed form analytic solutions.
+For |n| = 2, the SBF results in transcendental equations that require longer numerics to solve. 
+
+Fix: Scipy indexing starts at k=1, was currently using k=0 indexing. Also updated initial guess to be closer to roots based on known initial guess formulas. 
+"""
+
 def find_kth_sph_root(order, k, thresh=1e-8):
     """
     Finds kth root of spherical bessel function of the first kind of order n for -3 <= n <= 3
@@ -16,9 +28,12 @@ def find_kth_sph_root(order, k, thresh=1e-8):
     c = 0
     assert abs(order) in [0, 1, 2, 3], "Order out of bounds of function"
 
+    # print("order: ", order)
+    # print("k: ", k)
+
     if order == 0:
-        c = k * math.pi
-    elif  order in [-3, -2, -1, 1, 2, 3]:
+        c = (k+1) * math.pi
+    elif  order in range(-3, 4):
         """
         Using absolute order since J_(-n)(x) = (-1)^n * J_n(x)
         So,
@@ -27,12 +42,16 @@ def find_kth_sph_root(order, k, thresh=1e-8):
         n = abs(order) + 1/2
 
         # Works for k \in {1, 2, 3}
-        beta = k * n + 1.85575 * math.pow(n, (1/3)) + 1.033
-        
-        interval_begin = beta - math.pi/2
-        interval_end = beta + math.pi/2
+        # beta = (k+1) * n + 1.85575 * math.pow(n, (1/3)) + 1.033
 
-        guess = 1.0
+        guess = ((k+1) + abs(order)/2 - 1/4) * math.pi
+
+        # print("Guess 1: ", beta)
+        # print("Guess 2: ", guess)
+        
+        interval_begin = guess - math.pi/2
+        interval_end = guess + math.pi/2
+
         while abs(guess) > thresh:
             c = (interval_begin + interval_end)/2
             guess = jv(n, c)
@@ -50,7 +69,10 @@ def find_kth_sph_root(order, k, thresh=1e-8):
                 interval_end = c
             else:
                 interval_begin = c # root in [c, init_end]
-        print("Found root!")
+
+            # print("guess: ", guess)
+
+        # print("Found root!")
     return c
 
 def spherical_bessel_first_kind(
@@ -186,10 +208,13 @@ class RadialNetwork(nn.Module):
         )
         self.num_basis = num_basis
  
-    def _basis(self, r: torch.Tensor, order: int, k:int, cutoff_radius=3.0) -> torch.Tensor:
+    def _basis(self, r: torch.Tensor, degree: int, k:int, cutoff_radius=3.0) -> torch.Tensor:
         bases = []
 
-        for ord in range(-order, order + 1):
+        for ord in range(-degree, degree + 1): # order m ranges from -l to l (l is degree)
+            # print("negative degree to degree: ", degree) 
+            # print("order in loop: ", ord)
+            # print("k in loop: ", k)
             kth_root  = find_kth_sph_root(ord, k)                 
             argument  = (kth_root / cutoff_radius) * r         
 
