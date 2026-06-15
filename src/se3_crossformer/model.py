@@ -368,8 +368,8 @@ class SE3InterNeighborhoodTransformer(nn.Module):
 
         f0 = self.input_embedding(node_features).unsqueeze(-1)   # [N, feature_dim]
     
-        f1 = torch.randn(N, f0.shape[1], 3) * (1/math.sqrt(3.0))
-        f2 = torch.randn(N, f0.shape[1], 5) * (1/math.sqrt(5.0))
+        f1 = torch.randn(N, f0.shape[1], 3).to(f0.device) * (1/math.sqrt(3.0))
+        f2 = torch.randn(N, f0.shape[1], 5).to(f0.device) * (1/math.sqrt(5.0))
 
         f: Dict[int, torch.Tensor] = {0: f0,
                                       1: f1,

@@ -36,9 +36,12 @@ class CustomQM9Dataset(InMemoryDataset):
         root,
         sdf_file,
         csv_file,
+        device,
         transform=None,
         pre_transform=None,
     ):
+        self.device = device
+
         self.sdf_file = sdf_file
         self.csv_file = csv_file
 
@@ -110,7 +113,8 @@ class CustomQM9Dataset(InMemoryDataset):
 
             x = torch.tensor(
                 atom_features,
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             )
 
             ############################
@@ -143,12 +147,14 @@ class CustomQM9Dataset(InMemoryDataset):
 
             edge_index = torch.tensor(
                 [rows, cols],
-                dtype=torch.long
+                dtype=torch.long,
+                device=self.device
             )
 
             edge_attr = torch.tensor(
                 edge_features,
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             )
 
             ############################
@@ -159,7 +165,8 @@ class CustomQM9Dataset(InMemoryDataset):
 
             pos = torch.tensor(
                 conf.GetPositions(),
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             )
 
             if pos.shape[0] != x.shape[0]:
@@ -176,7 +183,8 @@ class CustomQM9Dataset(InMemoryDataset):
 
             y = torch.tensor(
                 target_values,
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             ).reshape(1, -1)
 
             ############################

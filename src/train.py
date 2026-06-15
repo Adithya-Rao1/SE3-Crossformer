@@ -46,7 +46,7 @@ def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
         dtype=torch.float32,
     )
 
-def load_qm9(target_idx: int, batch_size=16, root: str = "./data"):
+def load_qm9(target_idx: int, batch_size=16, r: str = "./data", device=torch.device("cpu")):
     """
     Load QM9 dataset via torch_geometric.
 
@@ -66,9 +66,10 @@ def load_qm9(target_idx: int, batch_size=16, root: str = "./data"):
         )
 
     dataset = CustomQM9Dataset(
-        root="./data/qm1", 
-        sdf_file="./data/qm9/raw/gdb9.sdf", 
-        csv_file="./data/qm9/raw/gdb9.sdf.csv",
+        root=r+"/qm1", 
+        sdf_file=r+"/qm9/raw/gdb9.sdf", 
+        csv_file=r+"/qm9/raw/gdb9.sdf.csv",
+        device=device,
     )
 
     dataset.y = dataset.y[:, target_idx]
@@ -205,7 +206,7 @@ def main():
     print(f"Device: {device}")
     print(f"QM9 target: {args.target}")
 
-    train_loader, val_loader, test_loader = load_qm9(args.target, args.batch_size, args.data_root)
+    train_loader, val_loader, test_loader = load_qm9(args.target, args.batch_size, args.data_root, args.device)
 
     trial_maes = []
     for trial in range(args.trials):
