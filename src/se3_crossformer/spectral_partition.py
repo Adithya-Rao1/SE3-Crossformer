@@ -118,9 +118,7 @@ def initial_message(
     num_subgraphs: int,
 ) -> Dict:
     """
-    TODO: The paper initialises m at l=1. Clarify whether m should be defined
-          for all degrees or only l=1, and whether mean-pooling is the right
-          aggregation (max, sum, attention-pool are alternatives).
+    Current issue: m_in is initialized as nans
     """
     m: Dict = {}
 
@@ -130,7 +128,6 @@ def initial_message(
         for s in range(num_subgraphs):
             mask = node_to_subgraph == s
             if mask.sum() > 0:
-                # print(feat.shape, mask.shape)
                 mask = mask.reshape(mask.shape[0], 1, 1)
                 m_l[s] = (feat * mask).mean(0)
                 counts[s] = mask.sum().float()

@@ -48,8 +48,6 @@ class QKProjection(nn.Module):
 
     # ------------------------------------------------------------------
     def query(self, f: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        # Fixed query vector formation by adding a direct sum
-
         q: Dict[int, torch.Tensor] = {}
 
         for l in range(self.max_degree + 1):
@@ -139,9 +137,6 @@ class IntraNeighborhoodAttention(nn.Module):
         k = {l: k[l].reshape(N, K, C, 2*l+1) for l in k}
 
         q_expanded = {l: q[l].unsqueeze(1) for l in q.keys()}
-
-        # print([k[l].shape for l in q.keys()])
-        # print([q_expanded[l].shape for l in q.keys()])
         scores = direct_sum_inner_product(q_expanded, k) / self.scale   # [N, K, C]
         scores = scores.sum(dim=-1)                                      # [N, K]
 
@@ -231,7 +226,7 @@ class CrossAttention(nn.Module):
         scores = scores.sum(dim=-1)                                      # [N, S]
 
         # Mask: node i must not attend to its own subgraph.
-        # own_subgraph[i, s] = True  iff node i belongs to subgraph s.
+        # own_subgraph[i, s] = True  if node i belongs to subgraph s.
         own_subgraph = (
             node_to_subgraph.unsqueeze(1)                         # [N, 1]
             == torch.arange(S, device=x.device).unsqueeze(0)     # [1, S]

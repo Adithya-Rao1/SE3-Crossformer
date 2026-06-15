@@ -113,7 +113,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
             self_term = self.W_V_self_intra[str(l)](f_in[l])   # [N, 2l+1]
 
             Wf_j = Wf_j_flat[l].view(N, K, C, 2 * l + 1)         # [N, K, C, 2l+1]
-            alpha_exp = alpha.unsqueeze(-1).unsqueeze(-1)                    # [N, K, 1, 1]
+            alpha_exp = alpha.sum(dim=-1).unsqueeze(-1).unsqueeze(-1)                  # [N, K, 1, 1]
             neighbor_term = (alpha_exp * Wf_j).sum(dim=1)       # [N, C, 2l+1]
 
             f_out[l] = self_term + neighbor_term
@@ -155,7 +155,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
             self_term = self.W_V_self_msg[str(l)](m_in[l])     # [S, 2l+1]
 
             Wm_j = Wm_j_flat[l].view(S, S, C, 2 * l + 1)         # [S, S, C, 2l+1]
-            beta_exp = beta.unsqueeze(-1).unsqueeze(-1)                      # [S, S, 1, 1]
+            beta_exp = beta.sum(dim=-1).unsqueeze(-1).unsqueeze(-1)                      # [S, S, 1, 1]
             neighbor_term = (beta_exp * Wm_j).sum(dim=1)        # [S, C, 2l+1]
 
             m_out[l] = self_term + neighbor_term
@@ -187,7 +187,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
 
         for l in f_out:
             feat = f_out[l]                                    # [N, 2l+1]
-            # cross_contrib = torch.zeros_like(feat)             # [N, 2l+1]
+            cross_contrib = torch.zeros_like(feat)             # [N, 2l+1]
 
             for k in m_out:
                 key = f"{l}_{k}"
@@ -206,7 +206,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
                     phi_b: Dict[int, torch.Tensor] = {}
                     for J_str, phi_net in phi_nets.items():
                         J = int(J_str)
-                        phi_b[J] = phi_net(m_k_b).expand(N)   # [N]
+                        phi_b[J] = phi_net(m_k_b).expand(N, 1)   # [N, 1]
 
                     class _FixedRadial(nn.Module):
                         def __init__(self, val):
@@ -234,9 +234,8 @@ class SE3InterNeighborhoodLayer(nn.Module):
                     # [N, 2l+1, 2k+1] @ [N, C, 2k+1] -> [N, C, 2l+1]
                     Wf = torch.einsum("nij,ncj->nci", W_b, f_k)
 
-                    # cross_contrib = cross_contrib + gamma[:, b].unsqueeze(-1).unsqueeze(-1) * Wf
+                    cross_contrib = cross_contrib + gamma[:, b].sum(dim=-1).unsqueeze(-1).unsqueeze(-1) * Wf
 
-            # Residual addition + layer-norm for training stability
             f_updated[l] = feat
 
         return f_updated
@@ -259,7 +258,6 @@ class SE3InterNeighborhoodLayer(nn.Module):
         num_subgraphs = x_cm.shape[0]
         m_in  = initial_message(f_out, node_to_subgraph, num_subgraphs)
         m_out = self._message_update(m_in, x_cm, subgraph_mask)
-
         f_out = self._cross_update(f_out, m_out, x, x_cm, node_to_subgraph, subgraph_mask)
 
         return f_out, m_out
@@ -366,17 +364,14 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         atomic_masses: torch.Tensor,      # [N]
     ) -> torch.Tensor:
         
-        # print("Node features shape: ", node_features.shape)
         N = node_features.shape[0]
 
-        h0 = self.input_embedding(node_features).unsqueeze(-1)   # [N, feature_dim]
-
-        # Degree 1 and 2 features initialization
+        f0 = self.input_embedding(node_features).unsqueeze(-1)   # [N, feature_dim]
     
-        f1 = torch.randn(N, h0.shape[1], 3) * (1/math.sqrt(3.0))
-        f2 = torch.randn(N, h0.shape[1], 5) * (1/math.sqrt(5.0))
+        f1 = torch.randn(N, f0.shape[1], 3) * (1/math.sqrt(3.0))
+        f2 = torch.randn(N, f0.shape[1], 5) * (1/math.sqrt(5.0))
 
-        f: Dict[int, torch.Tensor] = {0: h0,
+        f: Dict[int, torch.Tensor] = {0: f0,
                                       1: f1,
                                       2: f2}
 

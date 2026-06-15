@@ -91,9 +91,13 @@ def x_to_alpha_beta(x):
         alphas, betas = [], []
         for i in range(x.shape[0]):
             coords = x[i, :]
-            coords = coords/torch.norm(coords)
+            coords = coords/(torch.norm(coords) + 1e-8) # Was dividing relative positions of 0s by their norm, resulting in NaNs
             beta = acos(coords[2])
+            if torch.isnan(beta):
+                print(f"nan beta {i}: ", coords[2])
             alpha = atan2(coords[1], coords[0])
+            if torch.isnan(alpha):
+                print(f"nan alpha {i}: {[coords[1], coords[0]]}", )
             alphas.append(alpha)
             betas.append(beta)
 

@@ -33,10 +33,6 @@ from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
 
 from src.load_data import CustomQM9Dataset
 
-
-# ---------------------------------------------------------------------------
-# Periodic table atomic masses (H through Xe, 1-indexed)
-# ---------------------------------------------------------------------------
 # TODO: Extend or replace with a more complete lookup if heavier atoms appear.
 ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
@@ -50,12 +46,7 @@ def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
         dtype=torch.float32,
     )
 
-
-# ---------------------------------------------------------------------------
-# Dataset helpers
-# ---------------------------------------------------------------------------
-
-def load_qm9(target_idx: int, batch_size=4, root: str = "./data"):
+def load_qm9(target_idx: int, batch_size=16, root: str = "./data"):
     """
     Load QM9 dataset via torch_geometric.
 
@@ -82,11 +73,6 @@ def load_qm9(target_idx: int, batch_size=4, root: str = "./data"):
 
     dataset.y = dataset.y[:, target_idx]
 
-    # Filter to target property and normalize
-    # QM9.y has shape [N, 19]; targets 0-11 are the standard ones.
-
-
-    # Shuffle and split
     idx1 = 110000
     idx2 = 120000
     perm = torch.randperm(len(dataset))
@@ -100,11 +86,6 @@ def load_qm9(target_idx: int, batch_size=4, root: str = "./data"):
 
     return train_loader, val_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# One-hot atom feature encoding
-# ---------------------------------------------------------------------------
-
 ATOM_TYPES = [1, 6, 7, 8, 9]   # H, C, N, O, F  (QM9 atoms)
 
 def one_hot_z(z: torch.Tensor) -> torch.Tensor:
@@ -114,11 +95,6 @@ def one_hot_z(z: torch.Tensor) -> torch.Tensor:
         one_hot[:, idx] = (z == a).float()
     return one_hot
 
-
-# ---------------------------------------------------------------------------
-# Training utilities
-# ---------------------------------------------------------------------------
-
 def train_epoch(model, loader, optimizer, num_parts, device):
     model.train()
     total_loss = 0.0
@@ -126,7 +102,6 @@ def train_epoch(model, loader, optimizer, num_parts, device):
         print(f"[Batch:] {i+1}")
         batch = batch.to(device)
 
-        # Build inputs
         node_feat    = one_hot_z(batch.x).to(device)           # [N, 5]
         x            = batch.pos.to(device)                    # [N, 3]
         edge_index   = batch.edge_index.to(device)             # [2, E]
@@ -155,10 +130,6 @@ def train_epoch(model, loader, optimizer, num_parts, device):
             preds.append(pred)
         
         pred_batch = torch.stack(preds).squeeze(-1)   # [B]
-        # print("pred_batch shape: ", pred_batch.shape)
-        # print("target shape: ", target.shape)
-        print("Pred batch: ", pred_batch)
-        print("Targets: ", target.squeeze(-1))
         loss = nn.functional.l1_loss(pred_batch, target.squeeze(-1))
 
         optimizer.zero_grad()
@@ -169,7 +140,6 @@ def train_epoch(model, loader, optimizer, num_parts, device):
         print(f"Batch {i+1} Loss: {loss.item()}")
 
     return total_loss / len(loader)
-
 
 @torch.no_grad()
 def evaluate(model, loader, num_parts, device):
@@ -187,7 +157,7 @@ def evaluate(model, loader, num_parts, device):
         preds = []
         for g in range(len(ptr) - 1):
             nf   = node_feat[ptr[g]:ptr[g+1]]
-            if nf.shape[0] < num_parts: # Prevent n_samples < n_subgraphs for k-means clustering
+            if nf.shape[0] < num_parts:
                 mask = torch.arange(target.shape[0]) != g
                 target = target[mask]
                 target = target.view(-1, 19)
@@ -204,11 +174,6 @@ def evaluate(model, loader, num_parts, device):
 
     return total_mae / len(loader)
 
-
-# ---------------------------------------------------------------------------
-# Confidence interval (Section 4.2: 5 trials, 95% CI)
-# ---------------------------------------------------------------------------
-
 def confidence_interval_95(values):
     """Compute mean and 95% CI half-width from a list of values."""
     n    = len(values)
@@ -220,17 +185,12 @@ def confidence_interval_95(values):
     half_width = t_crit * std / math.sqrt(n)
     return mean, half_width
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target",     type=int,   default=1,   help="QM9 target index (0-11)")
     parser.add_argument("--num_parts",  type=int,   default=4,   help="Number of spectral subgraphs")
     parser.add_argument("--max_degree", type=int,   default=2,   help="Max SE(3) irrep degree")
-    parser.add_argument("--batch_size", type=int,   default=4)
+    parser.add_argument("--batch_size", type=int,   default=16)
     parser.add_argument("--num_layers", type=int,   default=4)
     parser.add_argument("--feature_dim",type=int,   default=32)
     parser.add_argument("--hidden_dim", type=int,   default=64)
@@ -279,7 +239,6 @@ def main():
             if epoch % 10 == 0:
                 print(f"  Epoch {epoch:3d} | train MAE: {train_loss:.4f} | val MAE: {val_mae:.4f}")
 
-        # Load best and evaluate on test
         model.load_state_dict(torch.load(f"best_model_trial{trial}.pt", map_location=device))
         test_mae = evaluate(model, test_loader, device)
         print(f"  Trial {trial + 1} test MAE: {test_mae:.4f}")
