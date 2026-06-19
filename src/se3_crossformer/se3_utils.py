@@ -9,6 +9,8 @@ from src.se3_crossformer.irr_rep import *
 from scipy.special import jv
 import math
 
+import time
+
 """
 Root problem seems to be for
 
@@ -221,7 +223,8 @@ class RadialNetwork(nn.Module):
  
     def forward(self, r: torch.Tensor, order: int, k: int) -> torch.Tensor:
         """r: [...], returns scalar [...] """
-        out = self.net(self._basis(r, order, k).to(r.device).reshape(-1, 2*order+1))
+        bases = self._basis(r, order, k)
+        out = self.net(bases.to(r.device).reshape(-1, 2*order+1))
         return out
  
 def apply_direct_sum_W(

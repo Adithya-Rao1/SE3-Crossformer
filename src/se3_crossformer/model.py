@@ -1,7 +1,10 @@
 import torch
+import torch_scatter
+from torch_scatter import scatter_mean
 import torch.nn as nn
 from typing import Dict, Optional, Tuple
 import math
+import time
 
 from src.se3_crossformer.se3_utils import (
     apply_direct_sum_W,
@@ -173,7 +176,6 @@ class SE3InterNeighborhoodLayer(nn.Module):
     ) -> Dict[int, torch.Tensor]:
         N = x.shape[0]
         S = x_cm.shape[0]
-        C = f_out[0].shape[1]
 
         gamma = self.cross_attn(
             f_out, m_out, x, x_cm, node_to_subgraph, subgraph_mask
@@ -196,8 +198,6 @@ class SE3InterNeighborhoodLayer(nn.Module):
 
                 m_k = m_out[k]                                 # [S, 2k+1]
                 phi_nets = self.msg_to_phi[key]                # {J: Linear}
-
-                m_k_expanded = m_k.unsqueeze(0).expand(N, S, C, 2 * k + 1)
 
                 for b in range(S):
                     x_rel_b = x_rel[:, b, :]                   # [N, 3]
@@ -253,8 +253,11 @@ class SE3InterNeighborhoodLayer(nn.Module):
         """
         Returns (f_out, m_out).
         """
-        f_out = self._intra_update(f_in, x, neighbor_idx, neighbor_mask)
 
+        """
+        Cross update and intra update taking the longest --> Take 2 orders of magnitude longer than inter update?
+        """
+        f_out = self._intra_update(f_in, x, neighbor_idx, neighbor_mask)
         num_subgraphs = x_cm.shape[0]
         m_in  = initial_message(f_out, node_to_subgraph, num_subgraphs)
         m_out = self._message_update(m_in, x_cm, subgraph_mask)
@@ -356,32 +359,83 @@ class SE3InterNeighborhoodTransformer(nn.Module):
 
         return neighbor_idx, neighbor_mask
 
+    # model.py  –  replace SE3InterNeighborhoodTransformer.forward
     def forward(
         self,
-        node_features: torch.Tensor,     # [N, d_in]
-        x: torch.Tensor,                  # [N, 3]
-        edge_index: torch.Tensor,         # [2, E]
-        atomic_masses: torch.Tensor,      # [N]
-    ) -> torch.Tensor:
+        node_features: torch.Tensor,   # [N_total, d_in]
+        x: torch.Tensor,               # [N_total, 3]
+        edge_index: torch.Tensor,      # [2, E_total]
+        atomic_masses: torch.Tensor,   # [N_total]
+        batch: torch.Tensor,           # [N_total]  graph index per node  ← NEW
+    ) -> torch.Tensor:                 # [B, out_dim]
         
         N = node_features.shape[0]
+        B = int(batch.max().item()) + 1
 
-        f0 = self.input_embedding(node_features).unsqueeze(-1)   # [N, feature_dim]
-    
-        f1 = torch.randn(N, f0.shape[1], 3).to(f0.device) * (1/math.sqrt(3.0))
-        f2 = torch.randn(N, f0.shape[1], 5).to(f0.device) * (1/math.sqrt(5.0))
+        # ── initial features ────────────────────────────────────────────────
+        f0 = self.input_embedding(node_features).unsqueeze(-1)        # [N, C, 1]
+        f1 = torch.randn(N, f0.shape[1], 3,  device=f0.device) * (1/math.sqrt(3.0))
+        f2 = torch.randn(N, f0.shape[1], 5,  device=f0.device) * (1/math.sqrt(5.0))
+        f: Dict[int, torch.Tensor] = {0: f0, 1: f1, 2: f2}
 
-        f: Dict[int, torch.Tensor] = {0: f0,
-                                      1: f1,
-                                      2: f2}
 
-        node_to_subgraph, x_cm, subgraph_mask = self._build_subgraph_info(
-            edge_index, N, x, atomic_masses
-        )
+        node_to_subgraph_list = []
+        x_cm_list             = []
+        subgraph_mask_list    = []  
+        neighbor_idx_list     = []
+        neighbor_mask_list    = []
 
-        neighbor_idx, neighbor_mask = self._build_neighbor_info(
-            edge_index, node_to_subgraph, N
-        )
+        ptr = [0]  
+        for g in range(B):
+            ptr.append(int((batch <= g).sum().item()))
+
+        subgraph_offset = 0
+        K_global = 0 
+
+        per_graph = []  
+
+        for g in range(B):
+            lo, hi = ptr[g], ptr[g + 1]
+            n_g = hi - lo
+
+            pos_g   = x[lo:hi]
+            mass_g  = atomic_masses[lo:hi]
+            mask_e  = (edge_index[0] >= lo) & (edge_index[0] < hi)
+            ei_g    = edge_index[:, mask_e] - lo          # local indices
+
+            n2s, xcm, smask = self._build_subgraph_info(ei_g, n_g, pos_g, mass_g)
+            nidx, nmask      = self._build_neighbor_info(ei_g, n2s, n_g)
+
+            per_graph.append((n2s + subgraph_offset, xcm, smask, nidx + lo, nmask))
+            subgraph_offset += self.num_parts
+            K_global = max(K_global, nidx.shape[1])
+
+        for g, (n2s, xcm, smask, nidx, nmask) in enumerate(per_graph):
+            K_g = nidx.shape[1]
+            if K_g < K_global:
+                pad_idx  = torch.zeros(nidx.shape[0],  K_global - K_g,
+                                    dtype=torch.long,  device=x.device)
+                pad_mask = torch.zeros(nmask.shape[0], K_global - K_g,
+                                    dtype=torch.bool,  device=x.device)
+                nidx  = torch.cat([nidx,  pad_idx],  dim=1)
+                nmask = torch.cat([nmask, pad_mask], dim=1)
+            node_to_subgraph_list.append(n2s)
+            x_cm_list.append(xcm)
+            subgraph_mask_list.append(smask)
+            neighbor_idx_list.append(nidx)
+            neighbor_mask_list.append(nmask)
+
+        node_to_subgraph = torch.cat(node_to_subgraph_list, dim=0)      
+        x_cm_all         = torch.cat(x_cm_list, dim=0)                   
+        neighbor_idx      = torch.cat(neighbor_idx_list, dim=0)           
+        neighbor_mask     = torch.cat(neighbor_mask_list, dim=0)         
+
+        S_total = B * self.num_parts
+        subgraph_mask_all = torch.zeros(S_total, S_total, dtype=torch.bool, device=x.device)
+        for g, smask in enumerate(subgraph_mask_list):
+            lo = g * self.num_parts
+            hi = lo + self.num_parts
+            subgraph_mask_all[lo:hi, lo:hi] = smask
 
         for layer in self.layers:
             f, _ = layer(
@@ -389,13 +443,12 @@ class SE3InterNeighborhoodTransformer(nn.Module):
                 x=x,
                 neighbor_idx=neighbor_idx,
                 neighbor_mask=neighbor_mask,
-                x_cm=x_cm,
+                x_cm=x_cm_all,
                 node_to_subgraph=node_to_subgraph,
-                subgraph_mask=subgraph_mask,
+                subgraph_mask=subgraph_mask_all,
             )
 
-        scalar_features = f[0]                       # [N, C, 1]
-        graph_embedding  = scalar_features.mean(0).flatten()   # [C]
-        out = self.readout[str(0)](graph_embedding)           # [out_dim]
-
+        scalar_features = f[0].squeeze(-1)                   # [N, C]
+        graph_embeddings = scatter_mean(scalar_features, batch, dim=0, dim_size=B)  # [B, C]
+        out = self.readout[str(0)](graph_embeddings)          # [B, out_dim]
         return out

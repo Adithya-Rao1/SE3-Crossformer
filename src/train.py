@@ -38,7 +38,6 @@ ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
 }
 
-
 def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
     """Map atomic number tensor [N] to mass tensor [N]."""
     return torch.tensor(
@@ -99,81 +98,112 @@ def one_hot_z(z: torch.Tensor) -> torch.Tensor:
 def train_epoch(model, loader, optimizer, num_parts, device):
     model.train()
     total_loss = 0.0
+    n_graphs   = 0
+
     for i, batch in enumerate(loader):
-        print(f"[Batch:] {i+1}")
+        print(f"[Batch]: {i+1}")
         batch = batch.to(device)
 
-        node_feat    = one_hot_z(batch.x).to(device)           # [N, 5]
-        x            = batch.pos.to(device)                    # [N, 3]
-        edge_index   = batch.edge_index.to(device)             # [2, E]
-        atomic_mass  = get_atomic_masses(batch.x).to(device)  # [N]
-        target       = batch.y.to(device)                      # [N_graphs, 19]
-        # print(batch.y.shape)
+        node_feat   = one_hot_z(batch.x).to(device)       
+        pos         = batch.pos.to(device)                  
+        edge_index  = batch.edge_index.to(device)
+        atomic_mass = get_atomic_masses(batch.x).to(device)
+        target      = batch.y.to(device)                   
+        graph_batch = batch.batch.to(device)               
 
-        # TODO: The current model.forward handles a single graph (no batch dim).
-        #       Add batch-aware scatter pooling for multi-graph batches.
-        #       For now, loop over graphs in the batch (slow but correct).
-        preds = []
-        ptr = batch.ptr  # [B+1] graph boundary indices
-        for g in range(len(ptr) - 1):
-            nf   = node_feat[ptr[g]:ptr[g+1]]
-            if nf.shape[0] < num_parts: # Prevent n_samples < n_subgraphs for k-means clustering
-                mask = torch.arange(target.shape[0]) != g
-                target = target[mask]
-                target = target.view(-1, 19)
-                continue
-            pos  = x[ptr[g]:ptr[g+1]]
-            mass = atomic_mass[ptr[g]:ptr[g+1]]
-            # Re-index edges to be local to the graph
-            local_ei = edge_index[:, (edge_index[0] >= ptr[g]) & (edge_index[0] < ptr[g+1])]
-            local_ei = local_ei - ptr[g]
-            pred = model(nf, pos, local_ei, mass)
-            preds.append(pred)
-        
-        pred_batch = torch.stack(preds).squeeze(-1)   # [B]
-        loss = nn.functional.l1_loss(pred_batch, target.squeeze(-1))
+        counts      = torch.bincount(graph_batch)          
+        valid_graph = counts >= num_parts                  
+        if not valid_graph.all():
+            keep_nodes  = valid_graph[graph_batch]
+            keep_graphs = valid_graph.nonzero(as_tuple=True)[0]
+            remap       = torch.full((valid_graph.shape[0],), -1,
+                                     dtype=torch.long, device=device)
+            remap[keep_graphs] = torch.arange(keep_graphs.shape[0], device=device)
+
+            node_mask   = keep_nodes
+            node_feat   = node_feat[node_mask]
+            pos         = pos[node_mask]
+            atomic_mass = atomic_mass[node_mask]
+            graph_batch = remap[graph_batch[node_mask]]
+            target      = target[keep_graphs]
+
+            src, dst    = edge_index
+            edge_mask   = node_mask[src] & node_mask[dst]
+            old_to_new  = torch.full((batch.num_nodes,), -1,
+                                     dtype=torch.long, device=device)
+            old_to_new[node_mask.nonzero(as_tuple=True)[0]] = \
+                torch.arange(node_mask.sum(), device=device)
+            edge_index  = old_to_new[edge_index[:, edge_mask]]
+
+        if graph_batch.max() < 0:  
+            continue
+
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)  
+        loss = nn.functional.l1_loss(pred.squeeze(-1), target)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * (len(ptr) - 1)
 
-        print(f"Batch {i+1} Loss: {loss.item()}")
+        B = pred.shape[0]
+        total_loss += loss.item() * B
+        n_graphs   += B
+        print(f"Batch {i+1} Loss: {loss.item():.4f}")
 
-    return total_loss / len(loader)
+    return total_loss / max(n_graphs, 1)
 
 @torch.no_grad()
 def evaluate(model, loader, num_parts, device):
     model.eval()
     total_mae = 0.0
-    for batch in loader:
+    n_graphs  = 0
+
+    for i, batch in enumerate(loader):
+        print(f"[Eval Batch]: {i+1}")
         batch = batch.to(device)
+
         node_feat   = one_hot_z(batch.x).to(device)
-        x           = batch.pos.to(device)
+        pos         = batch.pos.to(device)
         edge_index  = batch.edge_index.to(device)
         atomic_mass = get_atomic_masses(batch.x).to(device)
         target      = batch.y.to(device)
-        ptr         = batch.ptr
+        graph_batch = batch.batch.to(device)
 
-        preds = []
-        for g in range(len(ptr) - 1):
-            nf   = node_feat[ptr[g]:ptr[g+1]]
-            if nf.shape[0] < num_parts:
-                mask = torch.arange(target.shape[0]) != g
-                target = target[mask]
-                target = target.view(-1, 19)
-                continue
-            pos  = x[ptr[g]:ptr[g+1]]
-            mass = atomic_mass[ptr[g]:ptr[g+1]]
-            local_ei = edge_index[:, (edge_index[0] >= ptr[g]) & (edge_index[0] < ptr[g+1])]
-            local_ei = local_ei - ptr[g]
-            pred = model(nf, pos, local_ei, mass)
-            preds.append(pred)
+        counts      = torch.bincount(graph_batch)
+        valid_graph = counts >= num_parts
+        if not valid_graph.all():
+            keep_nodes  = valid_graph[graph_batch]
+            keep_graphs = valid_graph.nonzero(as_tuple=True)[0]
+            remap       = torch.full((valid_graph.shape[0],), -1,
+                                     dtype=torch.long, device=device)
+            remap[keep_graphs] = torch.arange(keep_graphs.shape[0], device=device)
 
-        pred_batch = torch.stack(preds)
-        total_mae += nn.functional.l1_loss(pred_batch, target).item()
+            node_mask   = keep_nodes
+            node_feat   = node_feat[node_mask]
+            pos         = pos[node_mask]
+            atomic_mass = atomic_mass[node_mask]
+            graph_batch = remap[graph_batch[node_mask]]
+            target      = target[keep_graphs]
 
-    return total_mae / len(loader)
+            src, dst   = edge_index
+            edge_mask  = node_mask[src] & node_mask[dst]
+            old_to_new = torch.full((batch.num_nodes,), -1,
+                                    dtype=torch.long, device=device)
+            old_to_new[node_mask.nonzero(as_tuple=True)[0]] = \
+                torch.arange(node_mask.sum(), device=device)
+            edge_index = old_to_new[edge_index[:, edge_mask]]
+
+        if graph_batch.max() < 0:
+            continue
+
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
+        mae  = nn.functional.l1_loss(pred.squeeze(-1), target).item()
+        B    = pred.shape[0]
+        total_mae += mae * B
+        n_graphs  += B
+        print(f"Batch {i+1} MAE: {mae:.4f}")
+
+    return total_mae / max(n_graphs, 1)
 
 def confidence_interval_95(values):
     """Compute mean and 95% CI half-width from a list of values."""
@@ -228,20 +258,22 @@ def main():
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
         best_val_mae = float("inf")
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(args.epochs):
+            print(f"[Epoch]: {epoch+1}")
             train_loss = train_epoch(model, train_loader, optimizer, args.num_parts, device)
             val_mae    = evaluate(model, val_loader, args.num_parts, device)
             scheduler.step()
 
             if val_mae < best_val_mae:
                 best_val_mae = val_mae
+                print(f"[Saving model with MAE loss]: {val_mae}")
                 torch.save(model.state_dict(), f"best_model_trial{trial}.pt")
 
             if epoch % 10 == 0:
                 print(f"  Epoch {epoch:3d} | train MAE: {train_loss:.4f} | val MAE: {val_mae:.4f}")
 
         model.load_state_dict(torch.load(f"best_model_trial{trial}.pt", map_location=device))
-        test_mae = evaluate(model, test_loader, device)
+        test_mae = evaluate(model, test_loader, args.num_parts, device)
         print(f"  Trial {trial + 1} test MAE: {test_mae:.4f}")
         trial_maes.append(test_mae)
 
