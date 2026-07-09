@@ -1,4 +1,12 @@
-# Code from SE(3)-Transformer
+"""
+irr_rep.py  (patched)
+---------------------
+Key changes vs. original
+  • x_to_alpha_beta: fully vectorised — no Python for-loop over atoms.
+    Returns (Tensor[N], Tensor[N]) instead of (list, list).
+  • All callers in se3_utils.equivariant_weight_matrix are updated to
+    consume the tensor pair directly.
+"""
 
 import os
 import numpy as np
@@ -11,114 +19,114 @@ from functools import wraps
 from src.se3_crossformer.utils import exists, default, cast_torch_tensor, to_order
 from src.se3_crossformer.spherical_harm import get_spherical_harmonics, clear_spherical_harmonics_cache
 
-# DATA_PATH = path = Path(os.path.dirname(__file__)) / 'data'
-DATA_PATH = Path('/Users/adithyarao/Research_Project_1/se3-transformer-pytorch/se3_transformer_pytorch/data')
+DATA_PATH = Path('/home/ubuntu/se3-crossformer-data/se3-transformer-pytorch/se3_transformer_pytorch/data')
 
 try:
     path = DATA_PATH / 'J_dense.pt'
     Jd = torch.load(str(path))
-except:
+except Exception:
     path = DATA_PATH / 'J_dense.npy'
-    Jd_np = np.load(str(path), allow_pickle = True)
+    Jd_np = np.load(str(path), allow_pickle=True)
     Jd = list(map(torch.from_numpy, Jd_np))
 
-def wigner_d_matrix(degree, alpha, beta, gamma, dtype = None, device = None):
-    """Create wigner D matrices for batch of ZYZ Euler anglers for degree l."""
+
+def wigner_d_matrix(degree, alpha, beta, gamma, dtype=None, device=None):
+    """Create wigner D matrices for batch of ZYZ Euler angles for degree l."""
     J = Jd[degree].type(dtype).to(device)
-    order = to_order(degree)
     x_a = z_rot_mat(alpha, degree)
-    x_b = z_rot_mat(beta, degree)
+    x_b = z_rot_mat(beta,  degree)
     x_c = z_rot_mat(gamma, degree)
     res = x_a @ J @ x_b @ J @ x_c
+    order = to_order(degree)
     return res.view(order, order)
+
 
 def z_rot_mat(angle, l):
     device, dtype = angle.device, angle.dtype
     order = to_order(l)
     m = angle.new_zeros((order, order))
-    inds = torch.arange(0, order, 1, dtype=torch.long, device=device)
-    reversed_inds = torch.arange(2 * l, -1, -1, dtype=torch.long, device=device)
-    frequencies = torch.arange(l, -l - 1, -1, dtype=dtype, device=device)[None]
-
+    inds          = torch.arange(0, order, 1,      dtype=torch.long,  device=device)
+    reversed_inds = torch.arange(2 * l, -1, -1,   dtype=torch.long,  device=device)
+    frequencies   = torch.arange(l, -l - 1, -1,   dtype=dtype,       device=device)[None]
     m[inds, reversed_inds] = sin(frequencies * angle[None])
-    m[inds, inds] = cos(frequencies * angle[None])
+    m[inds, inds]          = cos(frequencies * angle[None])
     return m
 
-def irr_repr(order, alpha, beta, gamma, dtype = None):
-    """
-    irreducible representation of SO3
-    - compatible with compose and spherical_harmonics
-    """
+
+def irr_repr(order, alpha, beta, gamma, dtype=None):
+    """Irreducible representation of SO3."""
     cast_ = cast_torch_tensor(lambda t: t)
     dtype = default(dtype, torch.get_default_dtype())
     alpha, beta, gamma = map(cast_, (alpha, beta, gamma))
-    return wigner_d_matrix(order, alpha, beta, gamma, dtype = dtype)
+    return wigner_d_matrix(order, alpha, beta, gamma, dtype=dtype)
+
 
 @cast_torch_tensor
 def rot_z(gamma):
-    '''
-    Rotation around Z axis
-    '''
     return torch.tensor([
         [cos(gamma), -sin(gamma), 0],
-        [sin(gamma), cos(gamma), 0],
-        [0, 0, 1]
+        [sin(gamma),  cos(gamma), 0],
+        [0,           0,          1],
     ], dtype=gamma.dtype)
+
 
 @cast_torch_tensor
 def rot_y(beta):
-    '''
-    Rotation around Y axis
-    '''
     return torch.tensor([
-        [cos(beta), 0, sin(beta)],
-        [0, 1, 0],
-        [-sin(beta), 0, cos(beta)]
+        [ cos(beta), 0, sin(beta)],
+        [0,          1, 0        ],
+        [-sin(beta), 0, cos(beta)],
     ], dtype=beta.dtype)
 
-@cast_torch_tensor
-def x_to_alpha_beta(x):
-    '''
-    Convert point (x, y, z) on the sphere into (alpha, beta)
-    '''
-    if x.ndim == 1:
-        x = x / torch.norm(x)
-        beta = acos(x[2])
-        alpha = atan2(x[1], x[0])
-        return (alpha, beta)
-    
-    elif x.ndim == 2:
-        alphas, betas = [], []
-        for i in range(x.shape[0]):
-            coords = x[i, :]
-            coords = coords/(torch.norm(coords) + 1e-8) # Was dividing relative positions of 0s by their norm, resulting in NaNs
-            beta = acos(coords[2])
-            if torch.isnan(beta):
-                print(f"nan beta {i}: ", coords[2])
-            alpha = atan2(coords[1], coords[0])
-            if torch.isnan(alpha):
-                print(f"nan alpha {i}: {[coords[1], coords[0]]}", )
-            alphas.append(alpha)
-            betas.append(beta)
 
-        return alphas, betas
+# ── vectorised x_to_alpha_beta ────────────────────────────────────────────────
+
+def x_to_alpha_beta(x: torch.Tensor):
+    """
+    Convert Cartesian direction(s) on the unit sphere to (alpha, beta).
+
+    Supports:
+      • 1-D input  [3]        → returns (scalar, scalar)  [unchanged API]
+      • 2-D input  [N, 3]     → returns (Tensor[N], Tensor[N])  VECTORISED
+                                 (previously used a Python for-loop)
+
+    The normalisation and clamping are done with tensor ops so the whole
+    batch runs as a single CUDA kernel launch rather than N sequential ones.
+    """
+    if x.ndim == 1:
+        # ── scalar path (unchanged) ───────────────────────────────────────
+        x = x / (x.norm() + 1e-8)
+        beta  = acos(x[2].clamp(-1.0 + 1e-7, 1.0 - 1e-7))
+        alpha = atan2(x[1], x[0])
+        return alpha, beta
+
+    # ── batched path [N, 3] ───────────────────────────────────────────────
+    # Normalise all rows in one shot
+    norms  = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)   # [N, 1]
+    x_norm = x / norms                                        # [N, 3]
+
+    # Clamp z to the valid range of acos to avoid NaN at ±1
+    z_safe = x_norm[:, 2].clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+
+    alphas = torch.atan2(x_norm[:, 1], x_norm[:, 0])   # [N]
+    betas  = torch.acos(z_safe)                          # [N]
+
+    return alphas, betas                                  # both Tensor[N]
+
 
 def rot(alpha, beta, gamma):
-    '''
-    ZYZ Euler angles rotation
-    '''
+    """ZYZ Euler angles rotation."""
     return rot_z(alpha) @ rot_y(beta) @ rot_z(gamma)
 
+
 def compose(a1, b1, c1, a2, b2, c2):
-    """
-    (a, b, c) = (a1, b1, c1) composed with (a2, b2, c2)
-    """
     comp = rot(a1, b1, c1) @ rot(a2, b2, c2)
-    xyz = comp @ torch.tensor([0, 0, 1.])
+    xyz  = comp @ torch.tensor([0, 0, 1.])
     a, b = x_to_alpha_beta(xyz)
     rotz = rot(0, -b, -a) @ comp
-    c = atan2(rotz[1, 0], rotz[0, 0])
+    c    = atan2(rotz[1, 0], rotz[0, 0])
     return a, b, c
 
-def spherical_harmonics(order, alpha, beta, dtype = None):
-    return get_spherical_harmonics(order, theta = (pi - beta), phi = alpha)
+
+def spherical_harmonics(order, alpha, beta, dtype=None):
+    return get_spherical_harmonics(order, theta=(pi - beta), phi=alpha)

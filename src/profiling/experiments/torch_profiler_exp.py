@@ -111,19 +111,19 @@ def run_torch_profiler_experiment(
     schedule = torch.profiler.schedule(
         wait   = 0,
         warmup = 1,
-        active = num_batches - 1,
+        active = 1,
         repeat = 1,
     )
 
     with torch.profiler.profile(
-        activities          = activities,
-        schedule            = schedule,
-        on_trace_ready      = torch.profiler.tensorboard_trace_handler(str(RESULTS_DIR / mode_label)),
-        record_shapes       = True,
-        profile_memory      = True,
-        with_stack          = True,
-        with_flops          = True,
-        with_modules        = True,
+        activities=activities,
+        schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(RESULTS_DIR / mode_label)),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
     ) as prof:
         for batch in batches:
             _step(batch)
