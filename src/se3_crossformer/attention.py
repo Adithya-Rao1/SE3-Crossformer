@@ -5,7 +5,6 @@ from typing import Dict
 
 from src.se3_crossformer.se3_utils import (
     apply_direct_sum_W,
-    RadialNetwork,
     softmax_over_neighbors,
 )
 
@@ -20,7 +19,7 @@ class EquivariantLinear(nn.Module):
 
 
 class QKProjection(nn.Module):
-    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int, batch_size=32):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int, batch_size=32):
         super().__init__()
         self.max_degree = max_degree
         self.W_Q = nn.ModuleDict({
@@ -33,7 +32,7 @@ class QKProjection(nn.Module):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 j_nets = nn.ModuleDict({
-                    str(J): RadialNetwork(num_basis=2*l+1, hidden_dim=hidden_dim)
+                    str(J): radial_net(num_basis=2*l+1, hidden_dim=hidden_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
                 self.radial_K[key] = j_nets
@@ -82,10 +81,10 @@ def _equivariant_inner_product(
 
 
 class IntraNeighborhoodAttention(nn.Module):
-    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int = 32):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 32):
         super().__init__()
         self.max_degree = max_degree
-        self.qk = QKProjection(max_degree, feature_dim, hidden_dim)
+        self.qk = QKProjection(radial_net, max_degree, feature_dim, hidden_dim)
         d = sum(2 * l + 1 for l in range(max_degree + 1))
         self.scale = d ** 0.5
 
@@ -127,10 +126,10 @@ class IntraNeighborhoodAttention(nn.Module):
 
 
 class InterNeighborhoodAttention(nn.Module):
-    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int = 32):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 32):
         super().__init__()
         self.max_degree = max_degree
-        self.qk = QKProjection(max_degree, feature_dim, hidden_dim)
+        self.qk = QKProjection(radial_net, max_degree, feature_dim, hidden_dim)
         d = sum(2 * l + 1 for l in range(max_degree + 1))
         self.scale = d ** 0.5
 
@@ -169,11 +168,11 @@ class InterNeighborhoodAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int = 32):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 32):
         super().__init__()
         self.max_degree = max_degree
-        self.qk_node = QKProjection(max_degree, feature_dim, hidden_dim)
-        self.qk_msg  = QKProjection(max_degree, feature_dim, hidden_dim)
+        self.qk_node = QKProjection(radial_net, max_degree, feature_dim, hidden_dim)
+        self.qk_msg  = QKProjection(radial_net, max_degree, feature_dim, hidden_dim)
         d = sum(2 * l + 1 for l in range(max_degree + 1))
         self.scale = d ** 0.5
 

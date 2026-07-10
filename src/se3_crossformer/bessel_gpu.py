@@ -73,8 +73,8 @@ def _spherical_jn_table(ell_values, x_nodes_per_seg, n_seg, N_cheb):
         jlp_batch = _scipy_jn(ell_int, x_batch, derivative=True)
 
         for i, s in enumerate(needs_fix):
-            jl_table[il, s] = torch.from_numpy(jl_batch[i * N_cheb:(i + 1) * N_cheb]).float()
-            jlp_table[il, s] = torch.from_numpy(jlp_batch[i * N_cheb:(i + 1) * N_cheb]).float()
+            jl_table[il, s] = (jl_batch[i * N_cheb:(i + 1) * N_cheb]).float()
+            jlp_table[il, s] = (jlp_batch[i * N_cheb:(i + 1) * N_cheb]).float()
 
     bad = ~torch.isfinite(jl_table)
     jl_table[bad] = 0.0

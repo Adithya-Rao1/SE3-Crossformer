@@ -294,7 +294,7 @@ class RadialNetworkGSFB(nn.Module):
         basis = self._basis(r)          # [N, num_orders]
         return self.net(basis)          # [N, 1]
 
-class RadialNetworkGRFB(nn.Module):
+class RadialNetworkGRBF(nn.Module):
     """
     Learnable radial function r → scalar.
 

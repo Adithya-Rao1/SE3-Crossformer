@@ -36,6 +36,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from src.se3_crossformer.model import SE3InterNeighborhoodTransformer, SE3IntraOnlyTransformer
 from src.load_data import CustomQM9Dataset
 from src.training_monitor import SystemMonitor
+from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB, RadialNetworkSFB
 
 ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
@@ -246,7 +247,7 @@ def confidence_interval_95(values):
     return mean, half_width
 
 
-def main():
+def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
     parser = argparse.ArgumentParser()
     parser.add_argument("--target",      type=int,   default=1)
     parser.add_argument("--num_parts",   type=int,   default=4)
@@ -255,6 +256,9 @@ def main():
     parser.add_argument("--accum_steps", type=int,   default=8,
                         help="Gradient accumulation steps. "
                              "Effective batch = batch_size * accum_steps.")
+    parser.add_argument("--partition_type", type=str, default="spectral")
+    parser.add_argument("--model_type", type=str, default="inter")
+    parser.add_argument("--rbf_type", type=str, default="grbf")
     parser.add_argument("--num_layers",  type=int,   default=4)
     parser.add_argument("--feature_dim", type=int,   default=32)
     parser.add_argument("--hidden_dim",  type=int,   default=64)
@@ -287,17 +291,42 @@ def main():
         print(f"\n--- Trial {trial + 1} / {args.trials} ---")
         torch.manual_seed(trial)
 
-        model = SE3InterNeighborhoodTransformer(
-            in_features=len(ATOM_TYPES),
-            max_degree=args.max_degree,
-            num_layers=args.num_layers,
-            feature_dim=args.feature_dim,
-            hidden_dim=args.hidden_dim,
-            num_parts=args.num_parts,
-            out_dim=19,
-            task="regression",
-        ).to(device)
+        if args.rbf_type == "grbf":
+            radial_net = RadialNetworkGRBF
+        elif args.rbf_type == "gsfb":
+            radial_net = RadialNetworkGSFB
+        else:
+            radial_net = RadialNetworkSFB
 
+        if args.model_type == "inter":
+            model = SE3InterNeighborhoodTransformer(
+                radial_net=radial_net,
+                in_features=len(ATOM_TYPES),
+                max_degree=args.max_degree,
+                num_layers=args.num_layers,
+                feature_dim=args.feature_dim,
+                hidden_dim=args.hidden_dim,
+                num_parts=args.num_parts,
+                out_dim=19,
+                task="regression",
+                partition_type=args.partition_type
+            ).to(device)
+        else:
+            model = SE3IntraOnlyTransformer(
+                radial_net=radial_net,
+                in_features=len(ATOM_TYPES),
+                max_degree=args.max_degree,
+                num_layers=args.num_layers,
+                feature_dim=args.feature_dim,
+                hidden_dim=args.hidden_dim,
+                num_parts=args.num_parts,
+                out_dim=19,
+                task="regression",
+                partition_type=args.partition_type
+            ).to(device)
+
+
+        
         optimizer = Adam(model.parameters(), lr=args.lr)
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
         monitor = SystemMonitor(device)

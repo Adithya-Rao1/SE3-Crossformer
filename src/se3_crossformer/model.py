@@ -7,7 +7,6 @@ import math
 import hashlib
 
 from src.se3_crossformer.se3_utils import apply_direct_sum_W
-from src.se3_crossformer.se3_utils import RadialNetworkGRFB as RadialNetwork
 from src.se3_crossformer.attention import (
     IntraNeighborhoodAttention,
     InterNeighborhoodAttention,
@@ -18,17 +17,18 @@ from src.se3_crossformer.spectral_partition import (
     subgraph_center_of_mass,
     initial_message,
 )
+from src.se3_crossformer.knn_partition import knn_partition
 
 from src.se3_crossformer.spherical_harm import get_spherical_harmonics
 
 # ── SE3InterNeighborhoodLayer ─────────────────────────────────────────────────
 
 class SE3InterNeighborhoodLayer(nn.Module):
-    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int = 64):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.max_degree  = max_degree
         self.feature_dim = feature_dim
-        self.intra_attn  = IntraNeighborhoodAttention(max_degree, feature_dim, hidden_dim)
+        self.intra_attn  = IntraNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
 
         self.W_V_self_intra = nn.ModuleDict({
             str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
@@ -40,11 +40,11 @@ class SE3InterNeighborhoodLayer(nn.Module):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 self.radial_V_intra[key] = nn.ModuleDict({
-                    str(J): RadialNetwork(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
+                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
 
-        self.inter_attn = InterNeighborhoodAttention(max_degree, feature_dim, hidden_dim)
+        self.inter_attn = InterNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
 
         self.W_V_self_msg = nn.ModuleDict({
             str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
@@ -56,11 +56,11 @@ class SE3InterNeighborhoodLayer(nn.Module):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 self.radial_V_msg[key] = nn.ModuleDict({
-                    str(J): RadialNetwork(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
+                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
 
-        self.cross_attn = CrossAttention(max_degree, feature_dim, hidden_dim)
+        self.cross_attn = CrossAttention(radial_net, max_degree, feature_dim, hidden_dim)
 
         self.msg_to_phi: nn.ModuleDict = nn.ModuleDict()
         for l in range(max_degree + 1):
@@ -300,6 +300,7 @@ class SE3InterNeighborhoodTransformer(nn.Module):
 
     def __init__(
         self,
+        radial_net,
         in_features: int,
         max_degree:  int = 2,
         num_layers:  int = 4,
@@ -308,11 +309,24 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         num_parts:   int = 4,
         out_dim:     int = 19,
         task:        str = "regression",
+        partition_type:             str = "spectral",  # "spectral" or "knn" — ablation switch
+        knn_k:                      int = 10,           # neighbors used by the "knn" partition
+        use_bond_info:              bool = True,        # spectral only: weight edges by bond order
+        bond_order_power:           float = 1.0,        # spectral only: soften/sharpen bond weighting
+        use_connectivity_features:  bool = False,       # spectral only: append degree/bond-order features
     ):
         super().__init__()
         self.max_degree = max_degree
         self.num_parts  = num_parts
         self.task       = task
+
+        assert partition_type in ("spectral", "knn"), \
+            f"partition_type must be 'spectral' or 'knn', got {partition_type!r}"
+        self.partition_type            = partition_type
+        self.knn_k                     = knn_k
+        self.use_bond_info             = use_bond_info
+        self.bond_order_power          = bond_order_power
+        self.use_connectivity_features = use_connectivity_features
 
         # ── graph construction cache ──────────────────────────────────────
         # Keyed by a hash of the edge index bytes (per graph).
@@ -324,7 +338,7 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         self.input_embedding = nn.Linear(in_features, feature_dim)
 
         self.layers = nn.ModuleList([
-            SE3InterNeighborhoodLayer(max_degree, feature_dim, hidden_dim)
+            SE3InterNeighborhoodLayer(radial_net, max_degree, feature_dim, hidden_dim)
             for _ in range(num_layers)
         ])
 
@@ -345,11 +359,29 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         num_nodes:     int,
         x:             torch.Tensor,
         atomic_masses: torch.Tensor,
+        edge_attr:     Optional[torch.Tensor] = None,   # [E_local] or [E_local, 1]
+                                                          # bond order for this graph's
+                                                          # local edges; spectral-only.
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        node_to_subgraph = spectral_partition(
-            edge_index, num_nodes, self.num_parts
-        ).to(x.device)
+        if self.partition_type == "spectral":
+            bond_order = edge_attr if (self.use_bond_info and edge_attr is not None) else None
+            node_to_subgraph = spectral_partition(
+                edge_index, num_nodes, self.num_parts,
+                bond_order=bond_order,
+                bond_order_power=self.bond_order_power,
+                use_connectivity_features=self.use_connectivity_features,
+            ).to(x.device)
+        elif self.partition_type == "knn":
+            # Purely geometric ablation baseline: clusters on 3D distance
+            # only, deliberately ignoring bond topology/edge_attr, so it can
+            # be compared against the molecular-info-aware spectral partition
+            # above.
+            node_to_subgraph = knn_partition(
+                x, num_nodes, self.num_parts, k=self.knn_k
+            ).to(x.device)
+        else:
+            raise ValueError(f"Unknown partition_type: {self.partition_type!r}")
 
         x_cm = subgraph_center_of_mass(
             x, atomic_masses, node_to_subgraph, self.num_parts
@@ -419,10 +451,26 @@ class SE3InterNeighborhoodTransformer(nn.Module):
 
         return neighbor_idx, neighbor_mask
 
+    def _partition_config_key(self) -> str:
+        """
+        Encodes everything about `_build_subgraph_info`'s behavior that isn't
+        already captured by the edge_index bytes, so `_graph_cache` can't
+        return a stale partition if `partition_type`/bond-info settings are
+        changed on a live model instance (e.g. during an ablation sweep).
+        """
+        return "|".join([
+            self.partition_type,
+            str(self.knn_k),
+            str(self.use_bond_info),
+            str(self.bond_order_power),
+            str(self.use_connectivity_features),
+        ])
+
     @staticmethod
-    def _edge_hash(edge_index_cpu: torch.Tensor, num_nodes: int) -> str:
+    def _edge_hash(edge_index_cpu: torch.Tensor, num_nodes: int, extra: str = "") -> str:
         h = hashlib.md5(edge_index_cpu.numpy().tobytes())
         h.update(num_nodes.to_bytes(4, 'little'))
+        h.update(extra.encode("utf-8"))
         return h.hexdigest()
 
     # ── forward ──────────────────────────────────────────────────────────
@@ -434,6 +482,12 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         edge_index:    torch.Tensor,   # [2, E_total]
         atomic_masses: torch.Tensor,   # [N_total]
         batch:         torch.Tensor,   # [N_total]
+        edge_attr:     Optional[torch.Tensor] = None,   # [E_total] or [E_total, 1]
+                                                          # bond order, e.g. PyG
+                                                          # Data.edge_attr from
+                                                          # CustomQM9Dataset. Only
+                                                          # used when partition_type
+                                                          # == "spectral".
     ) -> torch.Tensor:                 # [B, out_dim]
 
         N = node_features.shape[0]
@@ -460,6 +514,7 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         subgraph_offset = 0
         K_global        = 0
         per_graph       = []
+        partition_key   = self._partition_config_key()
 
         for g in range(B):
             lo, hi = ptr[g], ptr[g + 1]
@@ -469,9 +524,10 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             mass_g = atomic_masses[lo:hi]
             mask_e = (edge_index[0] >= lo) & (edge_index[0] < hi)
             ei_g   = edge_index[:, mask_e] - lo          # local indices
+            edge_attr_g = edge_attr[mask_e] if edge_attr is not None else None
 
             # ── cache lookup ──────────────────────────────────────────────
-            cache_key = self._edge_hash(ei_g.cpu(), n_g)
+            cache_key = self._edge_hash(ei_g.cpu(), n_g, partition_key)
             if cache_key in self._graph_cache:
                 n2s_local, xcm, smask, nidx_local, nmask = \
                     self._graph_cache[cache_key]
@@ -480,7 +536,7 @@ class SE3InterNeighborhoodTransformer(nn.Module):
                 xcm = subgraph_center_of_mass(pos_g, mass_g, n2s_local, self.num_parts)
             else:
                 n2s_local, xcm, smask = self._build_subgraph_info(
-                    ei_g, n_g, pos_g, mass_g
+                    ei_g, n_g, pos_g, mass_g, edge_attr=edge_attr_g
                 )
                 nidx_local, nmask = self._build_neighbor_info(
                     ei_g, n2s_local, n_g
@@ -557,12 +613,12 @@ class SE3IntraOnlyLayer(nn.Module):
     Ablation layer: performs ONLY the intra-neighborhood (node-node) update.
     """
  
-    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int = 64):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.max_degree  = max_degree
         self.feature_dim = feature_dim
  
-        self.intra_attn = IntraNeighborhoodAttention(max_degree, feature_dim, hidden_dim)
+        self.intra_attn = IntraNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
  
         self.W_V_self_intra = nn.ModuleDict({
             str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
@@ -574,7 +630,7 @@ class SE3IntraOnlyLayer(nn.Module):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 self.radial_V_intra[key] = nn.ModuleDict({
-                    str(J): RadialNetwork(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
+                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
 
@@ -646,6 +702,7 @@ class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
  
     def __init__(
         self,
+        radial_net, 
         in_features: int,
         max_degree:  int = 2,
         num_layers:  int = 4,
@@ -654,6 +711,11 @@ class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
         num_parts:   int = 4,
         out_dim:     int = 19,
         task:        str = "regression",
+        partition_type:             str = "spectral",
+        knn_k:                      int = 10,
+        use_bond_info:              bool = True,
+        bond_order_power:           float = 1.0,
+        use_connectivity_features:  bool = False,
     ):
         super().__init__(
             in_features=in_features,
@@ -664,9 +726,14 @@ class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
             num_parts=num_parts,
             out_dim=out_dim,
             task=task,
+            partition_type=partition_type,
+            knn_k=knn_k,
+            use_bond_info=use_bond_info,
+            bond_order_power=bond_order_power,
+            use_connectivity_features=use_connectivity_features,
         )
 
         self.layers = nn.ModuleList([
-            SE3IntraOnlyLayer(max_degree, feature_dim, hidden_dim)
+            SE3IntraOnlyLayer(radial_net, max_degree, feature_dim, hidden_dim)
             for _ in range(num_layers)
         ])
