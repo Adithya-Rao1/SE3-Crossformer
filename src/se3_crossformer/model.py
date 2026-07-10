@@ -1,29 +1,3 @@
-"""
-model.py  (patched)
---------------------
-Changes vs. original
-─────────────────────
-1.  SE3InterNeighborhoodTransformer._build_neighbor_info
-      • Replaced the Python adjacency-list loop with fully vectorised
-        tensor ops (torch.isin / scatter).  No per-node Python iteration.
-
-2.  SE3InterNeighborhoodTransformer.forward
-      • Spectral-partition & neighbor-graph results are memoised in
-        self._graph_cache (keyed on a hash of the per-graph edge index).
-        After the first epoch the cache is warm and graph construction
-        costs ~0 ms instead of ~360 ms/batch.
-
-3.  SE3InterNeighborhoodLayer._cross_update
-      • Eliminated the inner `for b in range(S)` loop.  All S subgraphs
-        are now processed in one batched einsum, replacing O(S) sequential
-        kernel launches with a single fused operation.
-      • The _FixedRadial inner class is gone; phi values are computed for
-        all (N, S) pairs simultaneously.
-
-4.  SE3InterNeighborhoodTransformer
-      • self._graph_cache dict added to __init__.
-"""
-
 import torch
 import torch_scatter
 from torch_scatter import scatter_mean
@@ -32,10 +6,8 @@ from typing import Dict, Optional, Tuple
 import math
 import hashlib
 
-from src.se3_crossformer.se3_utils import (
-    apply_direct_sum_W,
-    RadialNetwork,
-)
+from src.se3_crossformer.se3_utils import apply_direct_sum_W
+from src.se3_crossformer.se3_utils import RadialNetworkGRFB as RadialNetwork
 from src.se3_crossformer.attention import (
     IntraNeighborhoodAttention,
     InterNeighborhoodAttention,
@@ -577,3 +549,124 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         )                                                              # [B, C]
         out = self.readout[str(0)](graph_embeddings)                  # [B, out_dim]
         return out
+
+# ── SE3IntraOnlyLayer ─────────────────────────────────────────────────────
+ 
+class SE3IntraOnlyLayer(nn.Module):
+    """
+    Ablation layer: performs ONLY the intra-neighborhood (node-node) update.
+    """
+ 
+    def __init__(self, max_degree: int, feature_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.max_degree  = max_degree
+        self.feature_dim = feature_dim
+ 
+        self.intra_attn = IntraNeighborhoodAttention(max_degree, feature_dim, hidden_dim)
+ 
+        self.W_V_self_intra = nn.ModuleDict({
+            str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
+            for l in range(max_degree + 1)
+        })
+ 
+        self.radial_V_intra: nn.ModuleDict = nn.ModuleDict()
+        for l in range(max_degree + 1):
+            for k in range(max_degree + 1):
+                key = f"{l}_{k}"
+                self.radial_V_intra[key] = nn.ModuleDict({
+                    str(J): RadialNetwork(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
+                    for J in range(abs(l - k), l + k + 1)
+                })
+
+        self.layer_norm = nn.ModuleDict({
+            str(l): nn.LayerNorm(2 * l + 1)
+            for l in range(max_degree + 1)
+        })
+ 
+    def _intra_update(
+        self,
+        f_in:          Dict[int, torch.Tensor],   # {l: [N, C, 2l+1]}
+        x:             torch.Tensor,               # [N, 3]
+        neighbor_idx:  torch.Tensor,               # [N, K]
+        neighbor_mask: torch.Tensor,               # [N, K] bool
+    ) -> Dict[int, torch.Tensor]:
+        N, K = neighbor_idx.shape
+ 
+        alpha = self.intra_attn(f_in, x, neighbor_idx, neighbor_mask)
+ 
+        x_i   = x.unsqueeze(1).expand(N, K, 3)
+        x_j   = x[neighbor_idx.view(-1)].view(N, K, 3)
+        x_rel = (x_j - x_i).reshape(N * K, 3)
+ 
+        f_j_flat: Dict[int, torch.Tensor] = {
+            l: f_in[l][neighbor_idx.view(-1)] for l in f_in
+        }
+ 
+        Wf_j_flat = apply_direct_sum_W(
+            f=f_j_flat, x=x_rel,
+            radial_nets=self.radial_V_intra,
+            max_degree=self.max_degree,
+        )
+ 
+        f_out: Dict[int, torch.Tensor] = {}
+        for l in range(self.max_degree + 1):
+            if l not in f_in:
+                continue
+            C = f_in[l].shape[1]
+            self_term     = self.W_V_self_intra[str(l)](f_in[l])   # [N, 2l+1]
+            Wf_j          = Wf_j_flat[l].view(N, K, C, 2 * l + 1)
+            alpha_exp     = alpha.unsqueeze(-1).unsqueeze(-1)
+            neighbor_term = (alpha_exp * Wf_j).sum(dim=1)
+            f_out[l]      = self_term + neighbor_term
+ 
+        return f_out
+ 
+    def forward(
+        self,
+        f_in:             Dict[int, torch.Tensor],
+        x:                torch.Tensor,
+        neighbor_idx:     torch.Tensor,
+        neighbor_mask:    torch.Tensor,
+        x_cm:             torch.Tensor,            
+        node_to_subgraph: torch.Tensor,           
+        subgraph_mask:    torch.Tensor,            
+    ):
+        f_out = self._intra_update(f_in, x, neighbor_idx, neighbor_mask)
+        m_out: Dict[int, torch.Tensor] = {}
+        return f_out, m_out
+ 
+ 
+# ── SE3IntraOnlyTransformer ───────────────────────────────────────────────
+ 
+class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
+    """
+    Ablation model for isolating the effect of neighborhood-level
+    (inter-neighborhood + cross) updates.
+    """
+ 
+    def __init__(
+        self,
+        in_features: int,
+        max_degree:  int = 2,
+        num_layers:  int = 4,
+        feature_dim: int = 32,
+        hidden_dim:  int = 64,
+        num_parts:   int = 4,
+        out_dim:     int = 19,
+        task:        str = "regression",
+    ):
+        super().__init__(
+            in_features=in_features,
+            max_degree=max_degree,
+            num_layers=num_layers,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_parts=num_parts,
+            out_dim=out_dim,
+            task=task,
+        )
+
+        self.layers = nn.ModuleList([
+            SE3IntraOnlyLayer(max_degree, feature_dim, hidden_dim)
+            for _ in range(num_layers)
+        ])

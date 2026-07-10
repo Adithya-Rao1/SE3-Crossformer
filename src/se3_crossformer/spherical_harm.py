@@ -1,30 +1,3 @@
-"""
-spherical_harm.py  (optimized)
--------------------------------
-Key changes vs. original
-  • lpmv: replaced deep Python recursion with a fully-unrolled, tensor-native
-    iterative computation.  For each (l, m) pair the entire [N] batch is
-    computed in O(l) tensor ops instead of O(l) Python stack frames × many
-    elementwise kernel launches per frame.
-
-  • get_spherical_harmonics_element: now calls the iterative lpmv; no change
-    to the public signature.
-
-  • get_spherical_harmonics: the Python `for m in range(...)` loop is replaced
-    by a single vectorised pass that:
-      1. Builds cos(theta) once                      → [N]
-      2. Computes ALL lpmv values for a given l      → [N, 2l+1]  (one sweep)
-      3. Builds ALL cos/sin(m*phi) simultaneously    → [N, 2l+1]
-      4. Applies normalization constants (scalars)
-      5. Stacks with a single torch.stack            → [N, 2l+1]
-
-    This collapses (2l+1) separate Python iterations + (2l+1) separate lpmv
-    recursion trees into a handful of batched tensor ops and a single
-    torch.stack.
-
-  • clear_spherical_harmonics_cache: kept as a no-op stub for API compat.
-"""
-
 from math import pi, sqrt
 from functools import reduce, lru_cache
 from operator import mul
@@ -135,7 +108,6 @@ def lpmv(l: int, m: int, x: torch.Tensor) -> torch.Tensor:
     # --- standard three-term recurrence up to degree l ---
     p_prev2 = pmm     # P_{ll}^m
     p_prev1 = pmmp1   # P_{l+1,l}^m  (i.e. P_{m+1}^m at start)
-    p_curr  = pmmp1   # will be overwritten immediately
 
     for ll in range(m_abs + 2, l + 1):
         # (ll - m_abs) * P_ll^m = (2*ll-1)*x*P_{ll-1}^m - (ll+m_abs-1)*P_{ll-2}^m

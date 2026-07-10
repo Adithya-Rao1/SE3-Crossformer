@@ -8,7 +8,7 @@ from torch_geometric.datasets import QM9, ZINC
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch
 
-from atomic_datasets import GEOMDrugs
+# from atomic_datasets import GEOMDrugs
 
 import pandas as pd
 from rdkit import Chem
@@ -271,9 +271,9 @@ def load_data(dataset_type, config):
             dataset = ZINC(root='./data/zinc')
         loader = DataLoader(dataset=dataset,
                             **config)
-    elif dataset_type == "geom":
+    """elif dataset_type == "geom":
         dataset = GEOMDrugs(root_dir="data/geom")
-        loader = TorchLoader(dataset, **config, collate_fn=geom_collate_fn)
+        loader = TorchLoader(dataset, **config, collate_fn=geom_collate_fn)"""
     
     return loader
 
@@ -288,7 +288,3 @@ for batch in qm9_loader:
     print
     print(batch)
     break"""
-
-
-
-

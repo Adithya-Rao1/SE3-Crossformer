@@ -26,14 +26,16 @@ QM9 target indices (0-based, following torch_geometric convention):
 
 import argparse
 import math
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+from src.se3_crossformer.model import SE3InterNeighborhoodTransformer, SE3IntraOnlyTransformer
 from src.load_data import CustomQM9Dataset
+from src.training_monitor import SystemMonitor
 
 ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
@@ -132,7 +134,8 @@ def _filter_small_graphs(batch, num_parts, device):
     return node_feat, pos, edge_index, atomic_mass, target, graph_batch
 
 
-def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 1):
+def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 1,
+                 monitor: SystemMonitor = None):
     """
     One training epoch with gradient accumulation.
 
@@ -141,6 +144,10 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 
                      Effective batch size = loader.batch_size * accum_steps.
                      Loss is averaged over the accumulated micro-batches so
                      the gradient magnitude is independent of accum_steps.
+        monitor: optional SystemMonitor. If given, sample()d once per
+                 micro-batch and commit()ted once per accumulated step, so
+                 the recorded gpu/cpu/mem values are the mean over that
+                 step's micro-batches.
     """
     model.train()
     total_loss  = 0.0
@@ -167,6 +174,9 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 
         loss = nn.functional.l1_loss(pred.squeeze(-1), target) / accum_steps
         loss.backward()
 
+        if monitor is not None:
+            monitor.sample()
+
         accum_loss = accum_loss + loss.detach()
 
         B = pred.shape[0]
@@ -179,6 +189,8 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 
             optimizer.zero_grad()
 
             print(f"Batch {step_idx} | accum MAE: {accum_loss.item():.4f}")
+            if monitor is not None:
+                monitor.commit(step_idx, accum_loss.item())
             accum_loss = torch.tensor(0.0, device=device)
         else:
             print(f"Batch {step_idx} | micro-batch MAE: {loss.item() * accum_steps:.4f} "
@@ -191,6 +203,8 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 
         optimizer.step()
         optimizer.zero_grad()
         print(f"Flushed {remainder} remaining micro-batch(es).")
+        if monitor is not None:
+            monitor.commit(len(loader), accum_loss.item())
 
     return total_loss / max(n_graphs, 1)
 
@@ -245,11 +259,16 @@ def main():
     parser.add_argument("--feature_dim", type=int,   default=32)
     parser.add_argument("--hidden_dim",  type=int,   default=64)
     parser.add_argument("--lr",          type=float, default=1e-3)
-    parser.add_argument("--epochs",      type=int,   default=300)
-    parser.add_argument("--trials",      type=int,   default=5)
+    parser.add_argument("--epochs",      type=int,   default=10)
+    parser.add_argument("--trials",      type=int,   default=1)
     parser.add_argument("--data_root",   type=str,   default="/home/ubuntu/se3-crossformer-data/data")
+    parser.add_argument("--metrics_dir", type=str,   default="./training_metrics",
+                        help="Directory for per-trial loss/GPU/CPU/memory "
+                             "utilization CSVs and plots.")
     parser.add_argument("--device",      type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    os.makedirs(args.metrics_dir, exist_ok=True)
 
     device = torch.device(args.device)
     effective_batch = args.batch_size * args.accum_steps
@@ -281,13 +300,14 @@ def main():
 
         optimizer = Adam(model.parameters(), lr=args.lr)
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        monitor = SystemMonitor(device)
 
         best_val_mae = float("inf")
         for epoch in range(args.epochs):
             print(f"[Epoch {epoch + 1}]")
             train_loss = train_epoch(
                 model, train_loader, optimizer, args.num_parts, device,
-                accum_steps=args.accum_steps,
+                accum_steps=args.accum_steps, monitor=monitor,
             )
             val_mae = evaluate(model, val_loader, args.num_parts, device)
             scheduler.step()
@@ -299,6 +319,12 @@ def main():
 
             if epoch % 10 == 0:
                 print(f"  Epoch {epoch:3d} | train MAE: {train_loss:.4f} | val MAE: {val_mae:.4f}")
+
+        monitor.save_csv(os.path.join(args.metrics_dir, f"metrics_trial{trial}.csv"))
+        monitor.save_plots(
+            os.path.join(args.metrics_dir, f"metrics_trial{trial}.png"),
+            title_prefix=f"Custom model -- trial {trial}",
+        )
 
         model.load_state_dict(torch.load(f"best_model_trial{trial}.pt", map_location=device))
         test_mae = evaluate(model, test_loader, args.num_parts, device)

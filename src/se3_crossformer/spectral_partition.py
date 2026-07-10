@@ -1,19 +1,3 @@
-"""
-spectral_partition.py  (optimized)
-------------------------------------
-Key changes vs. original
-  • subgraph_center_of_mass: replaced the Python `for s in range(num_subgraphs)`
-    loop with a single scatter_add over all nodes simultaneously.
-    O(num_subgraphs) Python iterations → 2 GPU kernel launches.
-
-  • initial_message: replaced the Python `for s in range(num_subgraphs)` loop
-    with a vectorised scatter_mean over all nodes simultaneously.
-    O(num_subgraphs × num_degrees) Python iterations → O(num_degrees) kernel
-    launches (one scatter_mean per degree).
-
-  • build_laplacian, spectral_partition, _kmeans_cluster: unchanged.
-"""
-
 import torch
 import numpy as np
 from typing import Optional, Dict

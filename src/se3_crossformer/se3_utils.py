@@ -12,18 +12,6 @@ Key changes vs. original
         as a non-trainable buffer on the correct device.
       • forward() now accepts only (r,) — degree and k are no longer needed,
         simplifying all call sites.
-
-  ② equivariant_weight_matrix
-      • The per-J loop body now calls get_spherical_harmonics (vectorised,
-        from the optimized spherical_harm.py) instead of the old recursive
-        path.
-      • phi (radial scalar) is computed once per J as rnet(r) → [N, 1].
-      • All other logic (CG cache lookup, einsum) is unchanged but now runs
-        on fully-batched [N] tensors with no Python recursion in the inner
-        loop.
-
-  ③ Everything else (CG matrices, apply_direct_sum_W, direct_sum helpers,
-     softmax, verify_cg) is unchanged.
 """
 
 from math import pi, sqrt
@@ -37,7 +25,7 @@ import torch.nn as nn
 import numpy as np
 
 # Public re-export so existing importers don't break
-from .spherical_harm import (
+from src.se3_crossformer.spherical_harm import (
     get_spherical_harmonics,
     get_spherical_harmonics_element,
     clear_spherical_harmonics_cache,
@@ -46,6 +34,8 @@ from .spherical_harm import (
     pochhammer,
     CACHE,
 )
+
+from src.se3_crossformer.bessel_gpu import BesselTable
 
 # ---------------------------------------------------------------------------
 # Clebsch-Gordan matrices (unchanged)
@@ -101,10 +91,210 @@ def precompute_cg_matrices(max_degree: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ① RadialNetwork — GPU-native, no scipy in forward pass
+# 1. RadialNetwork — GPU-native, no scipy in forward pass
 # ---------------------------------------------------------------------------
 
-class RadialNetwork(nn.Module):
+def find_kth_sph_root(order, k, thresh=1e-8):
+    """
+    Finds kth root of spherical bessel function of the first kind of order n for -3 <= n <= 3
+    """
+    c = 0
+    assert abs(order) in [0, 1, 2, 3], "Order out of bounds of function"
+
+    # print("order: ", order)
+    # print("k: ", k)
+
+    if order == 0:
+        c = (k+1) * math.pi
+    elif  order in range(-3, 4):
+        """
+        Using absolute order since J_(-n)(x) = (-1)^n * J_n(x)
+        So,
+        J_(-n)(x) and J_n(x) have same roots
+        """
+        n = abs(order) + 1/2
+
+        # Works for k \in {1, 2, 3}
+        # beta = (k+1) * n + 1.85575 * math.pow(n, (1/3)) + 1.033
+
+        guess = ((k+1) + abs(order)/2 - 1/4) * math.pi
+
+        # print("Guess 1: ", beta)
+        # print("Guess 2: ", guess)
+        
+        interval_begin = guess - math.pi/2
+        interval_end = guess + math.pi/2
+
+        while abs(guess) > thresh:
+            c = (interval_begin + interval_end)/2
+            guess = jv(n, c)
+
+            """
+            If c < 0 and begin < 0, zero between c and end (+)
+
+            If c > 0 and begin < 0, zero between begin and c (-)
+
+            If c < 0 and begin > 0, zero between begin and c (-)
+
+            If c > 0 and begin > 0, zero between c and end (+)
+            """
+            if jv(n, interval_begin) * guess < 0: # root in [init_begin, c]
+                interval_end = c
+            else:
+                interval_begin = c # root in [c, init_end]
+
+            # print("guess: ", guess)
+
+        # print("Found root!")
+    return c
+
+def spherical_bessel_first_kind(
+    order: int,
+    argument,  
+    device: torch.device = torch.device("cuda"),
+) -> torch.Tensor:
+    if isinstance(argument, torch.Tensor):
+        arg_np = argument.detach().cpu().numpy()
+    elif isinstance(argument, np.ndarray):
+        arg_np = argument
+    else:
+        arg_np = np.asarray(argument, dtype=np.float64)
+
+    cyl   = jv(order + 0.5, arg_np)
+    cyl_t = torch.as_tensor(cyl, dtype=torch.float32, device=device)
+
+    safe   = cyl_t.abs().clamp(min=1e-12)
+    mag    = (math.pi / 2.0) ** 0.5 / safe.sqrt()
+    return torch.where(cyl_t >= 0, mag, -mag)
+
+class RadialNetworkSFB(nn.Module):
+    def __init__(self, num_basis: int, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(num_basis, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.num_basis = num_basis
+ 
+    def _basis(self, r: torch.Tensor, degree: int, k:int, cutoff_radius=3.0) -> torch.Tensor:
+        bases = []
+
+        for ord in range(-degree, degree + 1): # order m ranges from -l to l (l is degree)
+            kth_root  = find_kth_sph_root(ord, k)                 
+            argument  = (kth_root / cutoff_radius) * r         
+
+            sph_bes_denom = spherical_bessel_first_kind(ord + 1, kth_root, device='cpu')
+            sph_bes_r     = spherical_bessel_first_kind(ord,     argument,  device='cpu')
+
+            sph_bes_r = sph_bes_r.reshape(-1)  # [N_atoms]
+
+            norm_factor = (
+                2.0 / ((cutoff_radius ** 3) * (sph_bes_denom ** 2) * kth_root + 1e-12)
+            ) ** 0.5
+
+            e_sbf = (norm_factor * sph_bes_r)
+            bases.append(e_sbf)
+        
+        return torch.stack(bases, dim=0).reshape(-1, 1)
+ 
+    def forward(self, r: torch.Tensor, order: int, k: int) -> torch.Tensor:
+        """r: [...], returns scalar [...] """
+        bases = self._basis(r, order, k)
+        out = self.net(bases.to(r.device).reshape(-1, 2*order+1))
+        return out
+
+class RadialNetworkGSFB(nn.Module):
+    """
+    Args:
+        num_basis:     accepted for drop-in compatibility with existing call
+                        sites (`RadialNetwork(num_basis=(2*l+1), ...)`), but
+                        NOT used -- the Bessel-basis width is fixed by
+                        `orders`, not by this argument.
+        hidden_dim:    width of the 2-layer MLP mapping basis -> scalar.
+        cutoff_radius: envelope cutoff (Å or Bohr, must match positions).
+        orders:        which spherical Bessel orders l to use as features.
+        N_cheb:        Chebyshev nodes per segment (passed to BesselTable).
+        seg_width:     width of each piecewise segment (passed to BesselTable).
+    """
+ 
+    _table_cache: Dict[Tuple[Tuple[int, ...], float, int, float], "BesselTable"] = {}
+ 
+    def __init__(
+        self,
+        num_basis:     int = 8,          # unused; kept for interface parity
+        hidden_dim:    int = 32,
+        cutoff_radius: float = 5.0,
+        orders:        Tuple[int, ...] = (0, 1, 2, 3),
+        N_cheb:        int = 64,
+        seg_width:     float = 80.0,
+    ):
+        super().__init__()
+        self.cutoff_radius = float(cutoff_radius)
+        self.orders         = tuple(int(o) for o in orders)
+        self.num_orders      = len(self.orders)
+ 
+        table = self._get_or_build_table(self.orders, self.cutoff_radius, N_cheb, seg_width)
+ 
+        # Register as buffers (not parameters) so they move with .to()/.cuda()
+        # but are never trained -- only `self.net` below has learnable weights.
+        self.register_buffer("_coeffs", table.coeffs.clone())
+        self.n_seg             = table.n_seg
+        self.seg_width_actual  = table.seg_width_actual
+        self.N_cheb             = table.N_cheb
+ 
+        self.net = nn.Sequential(
+            nn.Linear(self.num_orders, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+ 
+    @classmethod
+    def _get_or_build_table(cls, orders, cutoff_radius, N_cheb, seg_width) -> "BesselTable":
+        key = (orders, float(cutoff_radius), int(N_cheb), float(seg_width))
+        if key not in cls._table_cache:
+            cls._table_cache[key] = BesselTable(
+                list(orders), x_max=cutoff_radius,
+                N_cheb=N_cheb, seg_width=seg_width, verbose=False,
+            )
+        return cls._table_cache[key]
+ 
+    def _map_to_segments(self, r_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        sw = self.seg_width_actual
+        x       = r_flat.clamp(min=0.0, max=self.cutoff_radius - 1e-6)
+        seg_idx = torch.floor(x / sw).clamp(min=0, max=self.n_seg - 1)
+        a       = seg_idx * sw
+        t_local = 2.0 * (x - a) / sw - 1.0
+        return seg_idx.long(), t_local
+ 
+    def _basis(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        r: Tensor[N, 1] distances (or any shape; flattened internally)
+        returns: Tensor[N, num_orders] == [j_l0(r), j_l1(r), ...] stacked
+        """
+        r_flat = r.reshape(-1).to(self._coeffs.dtype)
+        seg_idx, t_local = self._map_to_segments(r_flat)
+ 
+        c        = self._coeffs[:, seg_idx, :]                         # [num_orders, N, N_cheb]
+        theta    = torch.arccos(t_local.clamp(-1.0, 1.0))               # [N]
+        k_idx    = torch.arange(self.N_cheb, device=r.device, dtype=self._coeffs.dtype)
+        T_basis  = torch.cos(theta.unsqueeze(-1) * k_idx.unsqueeze(0))  # [N, N_cheb]
+        jl       = (c * T_basis.unsqueeze(0)).sum(dim=-1)               # [num_orders, N]
+        return jl.t().to(r.dtype)                                       # [N, num_orders]
+ 
+    def forward(self, r: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            r: Tensor[N, 1] -- distances on the correct device
+            *args, **kwargs: ignored (degree / k legacy args accepted but unused,
+                              matching RadialNetworkGRFB's forward contract)
+        Returns:
+            Tensor[N, 1]
+        """
+        basis = self._basis(r)          # [N, num_orders]
+        return self.net(basis)          # [N, 1]
+
+class RadialNetworkGRFB(nn.Module):
     """
     Learnable radial function r → scalar.
 
@@ -183,7 +373,7 @@ class RadialNetwork(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ② equivariant_weight_matrix — vectorised, no recursion in hot path
+# 2. equivariant_weight_matrix — vectorised, no recursion in hot path
 # ---------------------------------------------------------------------------
 
 def equivariant_weight_matrix(
@@ -194,15 +384,6 @@ def equivariant_weight_matrix(
 ) -> torch.Tensor:               # [N, 2l+1, 2k+1]
     """
     Equivariant weight matrix W^{lk}(x) summed over all valid J channels.
-
-    Changes vs. original
-    ─────────────────────
-    • get_spherical_harmonics is now called on fully-batched [N] tensors
-      (from the optimized spherical_harm.py) — no Python recursion per atom.
-    • radial_net.forward(r) takes only r; legacy (r, l, k) call sites are
-      still compatible because RadialNetwork.forward accepts *args.
-    • CG matrices are fetched from the module-level cache (populated by
-      precompute_cg_matrices at startup).
     """
     from .irr_rep import x_to_alpha_beta
 
@@ -244,11 +425,6 @@ def equivariant_weight_matrix(
         W   = W + had.view(N, 2 * l + 1, 2 * k + 1)
 
     return W
-
-
-# ---------------------------------------------------------------------------
-# Everything below is unchanged from the original se3_utils.py
-# ---------------------------------------------------------------------------
 
 def apply_direct_sum_W(
     f:           Dict[int, torch.Tensor],
