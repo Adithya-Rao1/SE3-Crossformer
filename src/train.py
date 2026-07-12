@@ -135,7 +135,7 @@ def _filter_small_graphs(batch, num_parts, device):
     return node_feat, pos, edge_index, atomic_mass, target, graph_batch
 
 
-def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 1,
+def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch, 
                  monitor: SystemMonitor = None):
     """
     One training epoch with gradient accumulation.
@@ -189,13 +189,13 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 
             optimizer.step()
             optimizer.zero_grad()
 
-            print(f"Batch {step_idx} | accum MAE: {accum_loss.item():.4f}")
+            # print(f"Batch {step_idx} | accum MAE: {accum_loss.item():.4f}")
             if monitor is not None:
                 monitor.commit(step_idx, accum_loss.item())
             accum_loss = torch.tensor(0.0, device=device)
-        else:
-            print(f"Batch {step_idx} | micro-batch MAE: {loss.item() * accum_steps:.4f} "
-                  f"({step_idx % accum_steps}/{accum_steps})")
+        # else:
+        #     print(f"Batch {step_idx} | micro-batch MAE: {loss.item() * accum_steps:.4f} "
+        #           f"({step_idx % accum_steps}/{accum_steps})")
 
     # Flush any remaining accumulated gradients at epoch end (when
     # len(loader) is not divisible by accum_steps).
@@ -207,6 +207,7 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps: int = 
         if monitor is not None:
             monitor.commit(len(loader), accum_loss.item())
 
+    print(f"Epoch: {epoch + 1} | Epoch MAE: {total_loss/max(n_graphs, 1):.4f}")
     return total_loss / max(n_graphs, 1)
 
 
@@ -341,7 +342,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
             print(f"[Epoch {epoch + 1}]")
             train_loss = train_epoch(
                 model, train_loader, optimizer, args.num_parts, device,
-                accum_steps=args.accum_steps, monitor=monitor,
+                accum_steps=args.accum_steps, epoch=epoch, monitor=monitor,
             )
             val_mae = evaluate(model, val_loader, args.num_parts, device)
             scheduler.step()
