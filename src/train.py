@@ -291,6 +291,11 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
         print(f"\n--- Trial {trial + 1} / {args.trials} ---")
         torch.manual_seed(trial)
 
+        checkpoint_path = os.path.join(
+            args.metrics_dir,
+            f"best_model_trial{trial}.pt"
+        )
+
         if args.rbf_type == "grbf":
             radial_net = RadialNetworkGRBF
         elif args.rbf_type == "gsfb":
@@ -344,7 +349,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
             if val_mae < best_val_mae:
                 best_val_mae = val_mae
                 print(f"  [New best] val MAE: {val_mae:.4f} — saving checkpoint.")
-                torch.save(model.state_dict(), f"best_model_trial{trial}.pt")
+                torch.save(model.state_dict(), checkpoint_path)
 
             if epoch % 10 == 0:
                 print(f"  Epoch {epoch:3d} | train MAE: {train_loss:.4f} | val MAE: {val_mae:.4f}")
@@ -352,10 +357,14 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
         monitor.save_csv(os.path.join(args.metrics_dir, f"metrics_trial{trial}.csv"))
         monitor.save_plots(
             os.path.join(args.metrics_dir, f"metrics_trial{trial}.png"),
-            title_prefix=f"Custom model -- trial {trial}",
+            title_prefix=(
+                f"PT={args.partition_type}, "
+                f"MT={args.model_type}, "
+                f"RBF={args.rbf_type}"
+            ),
         )
 
-        model.load_state_dict(torch.load(f"best_model_trial{trial}.pt", map_location=device))
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         test_mae = evaluate(model, test_loader, args.num_parts, device)
         print(f"  Trial {trial + 1} test MAE: {test_mae:.4f}")
         trial_maes.append(test_mae)

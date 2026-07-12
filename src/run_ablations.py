@@ -104,7 +104,7 @@ TEST_MAE_RE = re.compile(
 
 def build_command(run: AblationRun, args: argparse.Namespace, metrics_dir: str) -> list:
     cmd = [
-        sys.executable, args.train_script,
+        sys.executable, "-m", args.train_script,
         "--target", str(args.target),
         "--num_parts", str(args.num_parts),
         "--max_degree", str(args.max_degree),
@@ -164,15 +164,24 @@ def run_single_ablation(run: AblationRun, args: argparse.Namespace) -> dict:
         return result_row
 
     start = time.time()
+    # Stream stdout/stderr line-by-line straight to the log file (rather than
+    # buffering an entire day's worth of output in memory) and mirror it to
+    # the console so long runs are still watchable live.
     with open(log_path, "w") as log_file:
-        process = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
-        log_file.write(process.stdout)
+        for line in process.stdout:
+            log_file.write(line)
+            print(line, end="")
+        process.wait()
     elapsed = time.time() - start
 
     result_row["returncode"] = process.returncode
     result_row["wall_time_sec"] = round(elapsed, 1)
+
+    with open(log_path, "r") as f:
+        log_text = f.read()
 
     if process.returncode != 0:
         result_row["status"] = "failed"
@@ -180,7 +189,7 @@ def run_single_ablation(run: AblationRun, args: argparse.Namespace) -> dict:
         if args.stop_on_failure:
             raise RuntimeError(f"Ablation run {run.run_name} failed; see {log_path}")
     else:
-        parsed = parse_test_mae(process.stdout)
+        parsed = parse_test_mae(log_text)
         if parsed is not None:
             result_row["test_mae"], result_row["test_mae_ci95"] = parsed
         result_row["status"] = "success"
@@ -211,7 +220,7 @@ def write_summary_csv(rows: list, path: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SE3 transformer ablation sweeps.")
 
-    parser.add_argument("--train_script", type=str, default="train.py",
+    parser.add_argument("--train_script", type=str, default="src.train",
                          help="Path to train.py entry point.")
     parser.add_argument("--groups", type=str, nargs="+",
                          default=["graph_construction", "model_architecture", "rbf"],
@@ -228,7 +237,7 @@ def parse_args():
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--data_root", type=str,
                          default="/home/ubuntu/se3-crossformer-data/data")
@@ -265,7 +274,21 @@ def main():
 
     results = []
     for run in plan:
-        row = run_single_ablation(run, args)
+        try:
+            row = run_single_ablation(run, args)
+        except Exception as e:
+            if args.stop_on_failure:
+                raise
+            print(f"  [ERROR] Unhandled exception in {run.run_name}: {e!r}. "
+                  f"Continuing to next run.")
+            row = {
+                "group": run.group, "swept_param": run.swept_param,
+                "partition_type": run.partition_type, "model_type": run.model_type,
+                "rbf_type": run.rbf_type,
+                "metrics_dir": os.path.join(args.base_metrics_dir, run.group, run.run_name),
+                "returncode": None, "test_mae": None, "test_mae_ci95": None,
+                "wall_time_sec": None, "status": f"error: {e!r}",
+            }
         results.append(row)
         write_summary_csv(results, os.path.join(args.base_metrics_dir, "summary.csv"))
 
