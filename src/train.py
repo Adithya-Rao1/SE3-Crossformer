@@ -212,7 +212,7 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
 
 
 @torch.no_grad()
-def evaluate(model, loader, num_parts, device):
+def evaluate(model, loader, num_parts, device, epoch=None):
     model.eval()
     total_mae = 0.0
     n_graphs  = 0
@@ -233,8 +233,13 @@ def evaluate(model, loader, num_parts, device):
         B    = pred.shape[0]
         total_mae += mae * B
         n_graphs  += B
-        print(f"[Eval Batch {i+1}] MAE: {mae:.4f}")
+        #print(f"[Eval Batch {i+1}] MAE: {mae:.4f}")
 
+    if epoch:
+        print(f"Epoch: {epoch + 1} | Epoch Eval MAE: {total_mae/max(n_graphs, 1):.4f}")
+    else:
+        print(f"Eval MAE: {total_mae / max(n_graphs, 1):.4f}")
+        
     return total_mae / max(n_graphs, 1)
 
 
@@ -344,7 +349,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                 model, train_loader, optimizer, args.num_parts, device,
                 accum_steps=args.accum_steps, epoch=epoch, monitor=monitor,
             )
-            val_mae = evaluate(model, val_loader, args.num_parts, device)
+            val_mae = evaluate(model, val_loader, args.num_parts, device, epoch)
             scheduler.step()
 
             if val_mae < best_val_mae:

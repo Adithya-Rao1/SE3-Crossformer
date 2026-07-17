@@ -18,10 +18,65 @@ from src.se3_crossformer.spectral_partition import (
     initial_message,
 )
 from src.se3_crossformer.knn_partition import knn_partition
-
 from src.se3_crossformer.spherical_harm import get_spherical_harmonics
+from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
+from src.se3_crossformer.irr_rep import x_to_alpha_beta
 
-# ── SE3InterNeighborhoodLayer ─────────────────────────────────────────────────
+# Fixed change-of-basis: internal SH order (m=-1,0,+1) -> Cartesian (x,y,z).
+_C1 = math.sqrt(3.0 / (4 * math.pi))
+SH1_TO_CARTESIAN = torch.tensor([
+    [ 0.,  0., -1.],   # x = -Y_{+1}/c
+    [-1.,  0.,  0.],   # y = -Y_{-1}/c
+    [ 0.,  1.,  0.],   # z =  Y_{0} /c
+]) / _C1
+
+def _cartesian_quadrupole(n: torch.Tensor) -> torch.Tensor:
+    """
+    n: [N, 3] unit vectors -> [N, 5] traceless symmetric quadrupole
+    Q = n⊗n - I/3, independent components in order
+    [Qxx, Qxy, Qxz, Qyy, Qyz]  (Qzz = -Qxx-Qyy is implied by tracelessness).
+    """
+    X, Y, Z = n[:, 0], n[:, 1], n[:, 2]
+    Qxx = X * X - 1.0 / 3.0
+    Qyy = Y * Y - 1.0 / 3.0
+    Qxy = X * Y
+    Qxz = X * Z
+    Qyz = Y * Z
+    return torch.stack([Qxx, Qxy, Qxz, Qyy, Qyz], dim=-1)
+
+def fit_sh2_to_cartesian(n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
+    """
+    Fits the fixed linear map SH2 -> Cartesian-quadrupole by least squares
+    """
+    n = torch.randn(n_samples, 3, dtype=torch.float64)
+    n = n / n.norm(dim=-1, keepdim=True)
+
+    alpha, beta = x_to_alpha_beta(n)
+    theta = math.pi - beta
+    Y2 = get_spherical_harmonics(2, theta=theta, phi=alpha)   
+    T  = _cartesian_quadrupole(n)                             
+
+    M, *_ = torch.linalg.lstsq(Y2, T)
+    resid = (Y2 @ M - T).abs().max().item()
+    assert resid < tol, f"SH2->Cartesian fit residual too high: {resid:.2e}"
+
+    return M.T.float()  
+
+SH2_TO_CARTESIAN = fit_sh2_to_cartesian()
+
+class EquivariantReadout(nn.Module):
+    def __init__(self, C: int, hidden: int = 64):
+        super().__init__()
+        self.ll = nn.Sequential(
+            nn.Linear(C, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2)   
+        x = self.ll(x)          
+        return x.squeeze(-1)   
 
 class SE3InterNeighborhoodLayer(nn.Module):
     def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
@@ -76,14 +131,12 @@ class SE3InterNeighborhoodLayer(nn.Module):
             for l in range(max_degree + 1)
         })
 
-    # ── stage 1: intra-neighborhood update ───────────────────────────────
-
     def _intra_update(
         self,
-        f_in:          Dict[int, torch.Tensor],   # {l: [N, C, 2l+1]}
-        x:             torch.Tensor,               # [N, 3]
-        neighbor_idx:  torch.Tensor,               # [N, K]
-        neighbor_mask: torch.Tensor,               # [N, K] bool
+        f_in:          Dict[int, torch.Tensor],  
+        x:             torch.Tensor,              
+        neighbor_idx:  torch.Tensor,             
+        neighbor_mask: torch.Tensor,           
     ) -> Dict[int, torch.Tensor]:
         N, K = neighbor_idx.shape
 
@@ -108,7 +161,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
             if l not in f_in:
                 continue
             C = f_in[l].shape[1]
-            self_term    = self.W_V_self_intra[str(l)](f_in[l])   # [N, 2l+1]
+            self_term    = self.W_V_self_intra[str(l)](f_in[l]) 
             Wf_j         = Wf_j_flat[l].view(N, K, C, 2 * l + 1)
             alpha_exp    = alpha.unsqueeze(-1).unsqueeze(-1)
             neighbor_term = (alpha_exp * Wf_j).sum(dim=1)
@@ -116,18 +169,16 @@ class SE3InterNeighborhoodLayer(nn.Module):
 
         return f_out
 
-    # ── stage 2: inter-neighborhood (subgraph) update ────────────────────
-
     def _message_update(
         self,
-        m_in:          Dict[int, torch.Tensor],   # {l: [S, C, 2l+1]}
-        x_cm:          torch.Tensor,               # [S, 3]
-        subgraph_mask: torch.Tensor,               # [S, S] bool
+        m_in:          Dict[int, torch.Tensor],   
+        x_cm:          torch.Tensor,              
+        subgraph_mask: torch.Tensor,              
     ) -> Dict[int, torch.Tensor]:
         S = x_cm.shape[0]
         C = m_in[0].shape[1]
 
-        beta = self.inter_attn(m_in, x_cm, subgraph_mask)     # [S, S]
+        beta = self.inter_attn(m_in, x_cm, subgraph_mask)     
 
         x_cm_i = x_cm.unsqueeze(1).expand(S, S, 3)
         x_cm_j = x_cm.unsqueeze(0).expand(S, S, 3)
@@ -157,79 +208,59 @@ class SE3InterNeighborhoodLayer(nn.Module):
 
         return m_out
 
-    # ── stage 3: cross update (vectorised) ───────────────────────────────
-
     def _cross_update(
         self,
-        f_out:           Dict[int, torch.Tensor],   # {l: [N, C, 2l+1]}
-        m_out:           Dict[int, torch.Tensor],   # {l: [S, C, 2l+1]}
-        x:               torch.Tensor,               # [N, 3]
-        x_cm:            torch.Tensor,               # [S, 3]
-        node_to_subgraph: torch.Tensor,              # [N]
-        subgraph_mask:   torch.Tensor,               # [S, S]
+        f_out:           Dict[int, torch.Tensor], 
+        m_out:           Dict[int, torch.Tensor],  
+        x:               torch.Tensor,              
+        x_cm:            torch.Tensor,            
+        node_to_subgraph: torch.Tensor,        
+        subgraph_mask:   torch.Tensor,           
     ) -> Dict[int, torch.Tensor]:
-        """
-        Cross-attention update: each node attends to all subgraph messages.
-
-        Key change vs. original
-        ───────────────────────
-        The `for b in range(S)` Python loop has been replaced by a single
-        batched computation over all S subgraphs at once.
-
-        For each (l, k, J) triple we now:
-          1. Compute phi for all N×S pairs in one Linear forward.
-          2. Call equivariant_weight_matrix on x_rel [N*S, 3] once.
-          3. Apply gamma attention weights with a single einsum.
-        """
         N = x.shape[0]
         S = x_cm.shape[0]
 
         gamma = self.cross_attn(
             f_out, m_out, x, x_cm, node_to_subgraph, subgraph_mask
-        )  # [N, S]
+        )  
 
-        # Relative positions: [N, S, 3] → [N*S, 3] for batched W computation
         x_i    = x.unsqueeze(1).expand(N, S, 3)
         x_cm_j = x_cm.unsqueeze(0).expand(N, S, 3)
-        x_rel  = (x_cm_j - x_i).reshape(N * S, 3)   # [N*S, 3]
+        x_rel  = (x_cm_j - x_i).reshape(N * S, 3)   
 
         f_updated: Dict[int, torch.Tensor] = {}
 
         for l in f_out:
-            cross_contrib = torch.zeros_like(f_out[l])  # [N, C, 2l+1]
+            cross_contrib = torch.zeros_like(f_out[l])  
 
             for k in m_out:
                 key = f"{l}_{k}"
                 if key not in self.msg_to_phi:
                     continue
 
-                m_k      = m_out[k]            # [S, C, 2k+1]
+                m_k      = m_out[k]         
                 phi_nets = self.msg_to_phi[key]
                 C_k      = m_k.shape[1]
                 dim_k    = 2 * k + 1
 
-                # Flatten m_k to [S, C*(2k+1)] for the Linear
                 m_k_flat = m_k.reshape(S, C_k * dim_k)
 
                 for J_str, phi_net in phi_nets.items():
                     J = int(J_str)
                     
-                    phi_S  = phi_net(m_k_flat)                           # [S, 1]
-                    phi_NS = phi_S.unsqueeze(0).expand(N, S, 1).reshape(N*S, 1)                     # [N*S, 1]
+                    phi_S  = phi_net(m_k_flat)                           
+                    phi_NS = phi_S.unsqueeze(0).expand(N, S, 1).reshape(N*S, 1)                     
                 
-                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS) # [N*S, 2l+1, 2k+1]
+                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS) 
                     W    = W_NS.view(N, S, 2 * l + 1, 2 * k + 1)
                 
-                    # Contract W against subgraph messages m_out[k], not node features f_out[k]
-                    Wf = torch.einsum("nsij,scj->nsci", W, m_k)   # [N, S, C, 2l+1]
+                    Wf = torch.einsum("nsij,scj->nsci", W, m_k)   
                 
-                    gamma_exp     = gamma.unsqueeze(-1).unsqueeze(-1)   # [N, S, 1, 1]
-                    cross_contrib = cross_contrib + (gamma_exp * Wf).sum(dim=1) # [N, C, 2l+1]
+                    gamma_exp     = gamma.unsqueeze(-1).unsqueeze(-1)   
+                    cross_contrib = cross_contrib + (gamma_exp * Wf).sum(dim=1)
                     f_updated[l] = f_out[l] + cross_contrib
 
         return f_updated
-
-    # ── forward ──────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -253,51 +284,35 @@ class SE3InterNeighborhoodLayer(nn.Module):
                                     node_to_subgraph, subgraph_mask)
         return f_out, m_out
 
-
-# ── helpers used by _cross_update ────────────────────────────────────────────
-
 def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
     """Return the CG matrix for a single J from the cached dict."""
     from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
     return clebsch_gordan_matrix(l, k)[J]
 
-
 def _equivariant_weight_single_J(
-    x:   torch.Tensor,   # [N*S, 3]
+    x:   torch.Tensor,  
     l:   int,
     k:   int,
     J:   int,
-    phi: torch.Tensor,   # [N*S, 1]
-) -> torch.Tensor:       # [N*S, 2l+1, 2k+1]
-    """
-    Compute W^{lk}(x) restricted to a single J channel.
-    This is the inner loop body of equivariant_weight_matrix, extracted so
-    that _cross_update can call it without re-running all J values.
-    """
-    from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
-    from src.se3_crossformer.irr_rep import x_to_alpha_beta, spherical_harmonics
+    phi: torch.Tensor,  
+) -> torch.Tensor:     
 
     device, dtype = x.device, x.dtype
 
-    # Guard
     if x.shape[0] == 0:
         return torch.zeros(0, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype)
 
     cg    = clebsch_gordan_matrix(l, k)
-    Q_J   = cg[J].to(device=device, dtype=dtype)   # [(2l+1)(2k+1), 2J+1]
+    Q_J   = cg[J].to(device=device, dtype=dtype) 
 
-    alphas, betas = x_to_alpha_beta(x)             # Tensor[N*S] each
-    Y_J = get_spherical_harmonics(J, theta=(math.pi - betas), phi=alphas) # [N*S, 2J+1]
+    alphas, betas = x_to_alpha_beta(x)            
+    Y_J = get_spherical_harmonics(J, theta=(math.pi - betas), phi=alphas) 
 
-    # Q^T @ Y  →  [N*S, (2l+1)(2k+1)]
     QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)
-    had = phi * QTY                                 # [N*S, (2l+1)(2k+1)]
+    had = phi * QTY                               
     return had.view(x.shape[0], 2 * l + 1, 2 * k + 1)
 
-# ── SE3InterNeighborhoodTransformer ──────────────────────────────────────────
-
 class SE3InterNeighborhoodTransformer(nn.Module):
-
     def __init__(
         self,
         radial_net,
@@ -307,13 +322,13 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         feature_dim: int = 32,
         hidden_dim:  int = 64,
         num_parts:   int = 4,
-        out_dim:     int = 19,
-        task:        str = "regression",
-        partition_type:             str = "spectral",  # "spectral" or "knn" — ablation switch
-        knn_k:                      int = 10,           # neighbors used by the "knn" partition
-        use_bond_info:              bool = True,        # spectral only: weight edges by bond order
-        bond_order_power:           float = 1.0,        # spectral only: soften/sharpen bond weighting
-        use_connectivity_features:  bool = False,       # spectral only: append degree/bond-order features
+        scalar_out_dim:     int = 19, # 3 for polarizability tensor type-0 component
+        task:        int = 0,
+        partition_type:             str = "spectral",  
+        knn_k:                      int = 10,          
+        use_bond_info:              bool = True,        
+        bond_order_power:           float = 1.0,        
+        use_connectivity_features:  bool = False,       
     ):
         super().__init__()
         self.max_degree = max_degree
@@ -328,11 +343,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         self.bond_order_power          = bond_order_power
         self.use_connectivity_features = use_connectivity_features
 
-        # ── graph construction cache ──────────────────────────────────────
-        # Keyed by a hash of the edge index bytes (per graph).
-        # Stores: (node_to_subgraph, x_cm_local, neighbor_idx_local,
-        #          neighbor_mask_local, K_local)
-        # After the first epoch, graph construction costs ~0 ms.
         self._graph_cache: Dict[str, tuple] = {}
 
         self.input_embedding = nn.Linear(in_features, feature_dim)
@@ -342,16 +352,31 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.readout = nn.ModuleDict({
-            str(l): nn.Sequential(
-                nn.Linear((2 * l + 1) * feature_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
-            for l in range(max_degree + 1)
-        })
+        if task == 0:
+            self.readout = nn.Sequential(
+                    nn.Linear(feature_dim, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, scalar_out_dim),
+                )
 
-    # ── graph construction helpers ────────────────────────────────────────
+        elif task == 1:
+            self.register_buffer("sh1_to_cartesian", SH1_TO_CARTESIAN)
+            self.readout = EquivariantReadout(feature_dim)
+
+        elif task == 2:
+            self.register_buffer("sh2_to_cartesian", SH2_TO_CARTESIAN)
+            self.readout = EquivariantReadout(feature_dim)
+
+        else:
+            self.register_buffer("sh1_to_cartesian", SH1_TO_CARTESIAN)
+            self.register_buffer("sh2_to_cartesian", SH2_TO_CARTESIAN)
+            self.readout0 = nn.Sequential(
+                    nn.Linear(feature_dim, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, scalar_out_dim),
+                )
+            self.readout1 = EquivariantReadout(feature_dim)
+            self.readout2 = EquivariantReadout(feature_dim)
 
     def _build_subgraph_info(
         self,
@@ -359,9 +384,7 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         num_nodes:     int,
         x:             torch.Tensor,
         atomic_masses: torch.Tensor,
-        edge_attr:     Optional[torch.Tensor] = None,   # [E_local] or [E_local, 1]
-                                                          # bond order for this graph's
-                                                          # local edges; spectral-only.
+        edge_attr:     Optional[torch.Tensor] = None,  
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         if self.partition_type == "spectral":
@@ -373,10 +396,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
                 use_connectivity_features=self.use_connectivity_features,
             ).to(x.device)
         elif self.partition_type == "knn":
-            # Purely geometric ablation baseline: clusters on 3D distance
-            # only, deliberately ignoring bond topology/edge_attr, so it can
-            # be compared against the molecular-info-aware spectral partition
-            # above.
             node_to_subgraph = knn_partition(
                 x, num_nodes, self.num_parts, k=self.knn_k
             ).to(x.device)
@@ -396,37 +415,22 @@ class SE3InterNeighborhoodTransformer(nn.Module):
 
     def _build_neighbor_info(
         self,
-        edge_index:       torch.Tensor,   # [2, E_local]  local indices
-        node_to_subgraph: torch.Tensor,   # [N_local]
+        edge_index:       torch.Tensor,   
+        node_to_subgraph: torch.Tensor,  
         num_nodes:        int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Build dense [N, K] intra-subgraph neighbor tensors.
-
-        Change vs. original
-        ───────────────────
-        The Python adjacency-list loop has been replaced with vectorised
-        tensor operations:
-          1. Filter edges to intra-subgraph pairs with a boolean mask.
-          2. Compute K = max neighbours in one torch.bincount call.
-          3. Fill neighbor_idx via a cumulative-count scatter — no Python
-             iteration over nodes.
-        """
         device = edge_index.device
         src, dst = edge_index[0], edge_index[1]
 
-        # Keep only edges within the same subgraph
         same_sg   = node_to_subgraph[src] == node_to_subgraph[dst]
         src_intra = src[same_sg]
         dst_intra = dst[same_sg]
 
         if src_intra.numel() == 0:
-            # No intra-subgraph edges → every node is its own neighbour
             neighbor_idx  = torch.arange(num_nodes, device=device).unsqueeze(1)
             neighbor_mask = torch.zeros(num_nodes, 1, dtype=torch.bool, device=device)
             return neighbor_idx, neighbor_mask
 
-        # K = maximum number of intra-subgraph neighbours any single node has
         deg = torch.bincount(src_intra, minlength=num_nodes)   # [N]
         K   = int(deg.max().item())
         K   = max(K, 1)
@@ -434,12 +438,8 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         neighbor_idx  = torch.zeros(num_nodes, K, dtype=torch.long, device=device)
         neighbor_mask = torch.zeros(num_nodes, K, dtype=torch.bool, device=device)
 
-        # Use a running slot counter per node to fill neighbor_idx row-by-row
-        # without any Python loop.  torch.scatter_ with a cumulative index
-        # achieves this in O(E) tensor operations.
         slot = torch.zeros(num_nodes, dtype=torch.long, device=device)
         for _ in range(K):
-            # Find edges whose source node still has an unfilled slot at _
             available = slot[src_intra] == _
             s = src_intra[available]
             d = dst_intra[available]
@@ -452,12 +452,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         return neighbor_idx, neighbor_mask
 
     def _partition_config_key(self) -> str:
-        """
-        Encodes everything about `_build_subgraph_info`'s behavior that isn't
-        already captured by the edge_index bytes, so `_graph_cache` can't
-        return a stale partition if `partition_type`/bond-info settings are
-        changed on a live model instance (e.g. during an ablation sweep).
-        """
         return "|".join([
             self.partition_type,
             str(self.knn_k),
@@ -472,39 +466,57 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         h.update(num_nodes.to_bytes(4, 'little'))
         h.update(extra.encode("utf-8"))
         return h.hexdigest()
+    
+    def _seed_equivariant_features(
+        self,
+        f0:    torch.Tensor,   
+        x:     torch.Tensor,  
+        batch: torch.Tensor,  
+    ) -> Dict[int, torch.Tensor]:
+        B = int(batch.max().item()) + 1
+        center = scatter_mean(x, batch, dim=0, dim_size=B)    
+        x_rel  = x - center[batch]                              
 
-    # ── forward ──────────────────────────────────────────────────────────
+        r     = x_rel.norm(dim=-1).clamp(min=1e-8)             
+        x_hat = x_rel / r.unsqueeze(-1)                         
+
+        alpha, beta = x_to_alpha_beta(x_hat)
+        theta = math.pi - beta
+
+        Y1 = get_spherical_harmonics(1, theta=theta, phi=alpha)  
+        Y2 = get_spherical_harmonics(2, theta=theta, phi=alpha)
+
+        scalar = f0.squeeze(-1)         
+        radial = r.unsqueeze(-1)         
+
+        f1 = scalar.unsqueeze(-1) * (radial.unsqueeze(-1) * Y1.unsqueeze(1))  
+        f2 = scalar.unsqueeze(-1) * (radial.unsqueeze(-1) * Y2.unsqueeze(1))  
+
+        return {1: f1, 2: f2}
 
     def forward(
         self,
-        node_features: torch.Tensor,   # [N_total, d_in]
-        x:             torch.Tensor,   # [N_total, 3]
-        edge_index:    torch.Tensor,   # [2, E_total]
-        atomic_masses: torch.Tensor,   # [N_total]
-        batch:         torch.Tensor,   # [N_total]
-        edge_attr:     Optional[torch.Tensor] = None,   # [E_total] or [E_total, 1]
-                                                          # bond order, e.g. PyG
-                                                          # Data.edge_attr from
-                                                          # CustomQM9Dataset. Only
-                                                          # used when partition_type
-                                                          # == "spectral".
-    ) -> torch.Tensor:                 # [B, out_dim]
+        node_features: torch.Tensor,  
+        x:             torch.Tensor,   
+        edge_index:    torch.Tensor,   
+        atomic_masses: torch.Tensor,   
+        batch:         torch.Tensor,   
+        edge_attr:     Optional[torch.Tensor] = None, 
+        vec_feat:      Optional[torch.tensor] = None,
+        tensor_feat:   Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:               
 
         N = node_features.shape[0]
         B = int(batch.max().item()) + 1
 
-        # ── initial features ──────────────────────────────────────────────
-        f0 = self.input_embedding(node_features).unsqueeze(-1)        # [N, C, 1]
-        f1 = torch.randn(N, f0.shape[1], 3, device=f0.device) * (1 / math.sqrt(3.0))
-        f2 = torch.randn(N, f0.shape[1], 5, device=f0.device) * (1 / math.sqrt(5.0))
-        f: Dict[int, torch.Tensor] = {0: f0, 1: f1, 2: f2}
+        f0 = self.input_embedding(node_features).unsqueeze(-1)       
+        seeded = self._seed_equivariant_features(f0, x, batch)
+        f: Dict[int, torch.Tensor] = {0: f0, 1: seeded[1], 2: seeded[2]}
 
-        # ── build pointer array ───────────────────────────────────────────
         ptr = [0]
         for g in range(B):
             ptr.append(int((batch <= g).sum().item()))
 
-        # ── per-graph graph construction (with caching) ───────────────────
         node_to_subgraph_list: list = []
         x_cm_list:             list = []
         subgraph_mask_list:    list = []
@@ -523,16 +535,13 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             pos_g  = x[lo:hi]
             mass_g = atomic_masses[lo:hi]
             mask_e = (edge_index[0] >= lo) & (edge_index[0] < hi)
-            ei_g   = edge_index[:, mask_e] - lo          # local indices
+            ei_g   = edge_index[:, mask_e] - lo          
             edge_attr_g = edge_attr[mask_e] if edge_attr is not None else None
 
-            # ── cache lookup ──────────────────────────────────────────────
             cache_key = self._edge_hash(ei_g.cpu(), n_g, partition_key)
             if cache_key in self._graph_cache:
                 n2s_local, xcm, smask, nidx_local, nmask = \
                     self._graph_cache[cache_key]
-                # Re-derive positions-dependent xcm (positions can change
-                # during training even if topology is fixed)
                 xcm = subgraph_center_of_mass(pos_g, mass_g, n2s_local, self.num_parts)
             else:
                 n2s_local, xcm, smask = self._build_subgraph_info(
@@ -555,7 +564,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             subgraph_offset += self.num_parts
             K_global = max(K_global, nidx_local.shape[1])
 
-        # ── pad K dimension to K_global ───────────────────────────────────
         for g, (n2s, xcm, smask, nidx, nmask) in enumerate(per_graph):
             K_g = nidx.shape[1]
             if K_g < K_global:
@@ -571,7 +579,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             neighbor_idx_list.append(nidx)
             neighbor_mask_list.append(nmask)
 
-        # ── assemble global tensors ───────────────────────────────────────
         node_to_subgraph  = torch.cat(node_to_subgraph_list, dim=0)
         x_cm_all          = torch.cat(x_cm_list,             dim=0)
         neighbor_idx      = torch.cat(neighbor_idx_list,     dim=0)
@@ -586,7 +593,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             hi = lo + self.num_parts
             subgraph_mask_all[lo:hi, lo:hi] = smask
 
-        # ── layer forward passes ──────────────────────────────────────────
         for layer in self.layers:
             f, _ = layer(
                 f_in             = f,
@@ -598,21 +604,32 @@ class SE3InterNeighborhoodTransformer(nn.Module):
                 subgraph_mask    = subgraph_mask_all,
             )
 
-        # ── readout ───────────────────────────────────────────────────────
-        scalar_features  = f[0].squeeze(-1)                           # [N, C]
-        graph_embeddings = scatter_mean(
-            scalar_features, batch, dim=0, dim_size=B
-        )                                                              # [B, C]
-        out = self.readout[str(0)](graph_embeddings)                  # [B, out_dim]
-        return out
+        if self.task == 0:
+            scalar_features  = f[0].squeeze(-1)                          
+            graph_embeddings = scatter_mean(
+                scalar_features, batch, dim=0, dim_size=B
+            )                                                              
+            out = self.readout(graph_embeddings)                       
+            return out
+        elif self.task == 1:
+            vector_features = f[1]                                   
+            graph_embeddings = scatter_mean(
+                vector_features, batch, dim=0, dim_size=B
+            )                                                          
+            out_sh = self.readout(graph_embeddings)                       
+            out    = torch.einsum('ij,bj->bi', self.sh1_to_cartesian, out_sh) 
+            return out                        
 
-# ── SE3IntraOnlyLayer ─────────────────────────────────────────────────────
+        elif self.task == 2:
+            tensor_features = f[2]                                        
+            graph_embeddings = scatter_mean(
+                tensor_features, batch, dim=0, dim_size=B
+            )                                                                   
+            out_sh = self.readout(graph_embeddings)                            
+            out    = torch.einsum('ij,bj->bi', self.sh2_to_cartesian, out_sh)   
+            return out
  
 class SE3IntraOnlyLayer(nn.Module):
-    """
-    Ablation layer: performs ONLY the intra-neighborhood (node-node) update.
-    """
- 
     def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.max_degree  = max_degree
@@ -641,10 +658,10 @@ class SE3IntraOnlyLayer(nn.Module):
  
     def _intra_update(
         self,
-        f_in:          Dict[int, torch.Tensor],   # {l: [N, C, 2l+1]}
-        x:             torch.Tensor,               # [N, 3]
-        neighbor_idx:  torch.Tensor,               # [N, K]
-        neighbor_mask: torch.Tensor,               # [N, K] bool
+        f_in:          Dict[int, torch.Tensor],   
+        x:             torch.Tensor,               
+        neighbor_idx:  torch.Tensor,             
+        neighbor_mask: torch.Tensor,              
     ) -> Dict[int, torch.Tensor]:
         N, K = neighbor_idx.shape
  
@@ -669,7 +686,7 @@ class SE3IntraOnlyLayer(nn.Module):
             if l not in f_in:
                 continue
             C = f_in[l].shape[1]
-            self_term     = self.W_V_self_intra[str(l)](f_in[l])   # [N, 2l+1]
+            self_term     = self.W_V_self_intra[str(l)](f_in[l])   
             Wf_j          = Wf_j_flat[l].view(N, K, C, 2 * l + 1)
             alpha_exp     = alpha.unsqueeze(-1).unsqueeze(-1)
             neighbor_term = (alpha_exp * Wf_j).sum(dim=1)
@@ -690,16 +707,8 @@ class SE3IntraOnlyLayer(nn.Module):
         f_out = self._intra_update(f_in, x, neighbor_idx, neighbor_mask)
         m_out: Dict[int, torch.Tensor] = {}
         return f_out, m_out
- 
- 
-# ── SE3IntraOnlyTransformer ───────────────────────────────────────────────
- 
+  
 class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
-    """
-    Ablation model for isolating the effect of neighborhood-level
-    (inter-neighborhood + cross) updates.
-    """
- 
     def __init__(
         self,
         radial_net, 
@@ -709,29 +718,15 @@ class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
         feature_dim: int = 32,
         hidden_dim:  int = 64,
         num_parts:   int = 4,
-        out_dim:     int = 19,
-        task:        str = "regression",
+        scalar_out_dim:     int = 19, # 3 for polarizability tensor type-0 component
+        task:        int = 0,
         partition_type:             str = "spectral",
         knn_k:                      int = 10,
         use_bond_info:              bool = True,
         bond_order_power:           float = 1.0,
         use_connectivity_features:  bool = False,
     ):
-        super().__init__(
-            in_features=in_features,
-            max_degree=max_degree,
-            num_layers=num_layers,
-            feature_dim=feature_dim,
-            hidden_dim=hidden_dim,
-            num_parts=num_parts,
-            out_dim=out_dim,
-            task=task,
-            partition_type=partition_type,
-            knn_k=knn_k,
-            use_bond_info=use_bond_info,
-            bond_order_power=bond_order_power,
-            use_connectivity_features=use_connectivity_features,
-        )
+        super().__init__()
 
         self.layers = nn.ModuleList([
             SE3IntraOnlyLayer(radial_net, max_degree, feature_dim, hidden_dim)
