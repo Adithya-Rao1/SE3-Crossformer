@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch_scatter
 from torch_scatter import scatter_mean
@@ -62,7 +64,22 @@ def fit_sh2_to_cartesian(n_samples: int = 20000, tol: float = 1e-4) -> torch.Ten
 
     return M.T.float()  
 
-SH2_TO_CARTESIAN = fit_sh2_to_cartesian()
+if os.path.exists("sh2_cartesian.pt"):
+    SH2_TO_CARTESIAN = torch.load("sh2_cartesian.pt")
+else:
+    SH2_TO_CARTESIAN = fit_sh2_to_cartesian()
+    torch.save(SH2_TO_CARTESIAN, "sh2_cartesian.pt")
+
+class IrrepLinear(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.weight = nn.Linear(channels, channels)
+
+    def forward(self, x):
+        # x: [N,C,m]
+        x = x.transpose(1,2)
+        x = self.weight(x)
+        return x.transpose(1,2)
 
 class EquivariantReadout(nn.Module):
     def __init__(self, C: int, hidden: int = 64):
@@ -77,212 +94,6 @@ class EquivariantReadout(nn.Module):
         x = x.transpose(1, 2)   
         x = self.ll(x)          
         return x.squeeze(-1)   
-
-class SE3InterNeighborhoodLayer(nn.Module):
-    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
-        super().__init__()
-        self.max_degree  = max_degree
-        self.feature_dim = feature_dim
-        self.intra_attn  = IntraNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
-
-        self.W_V_self_intra = nn.ModuleDict({
-            str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
-            for l in range(max_degree + 1)
-        })
-
-        self.radial_V_intra: nn.ModuleDict = nn.ModuleDict()
-        for l in range(max_degree + 1):
-            for k in range(max_degree + 1):
-                key = f"{l}_{k}"
-                self.radial_V_intra[key] = nn.ModuleDict({
-                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
-                    for J in range(abs(l - k), l + k + 1)
-                })
-
-        self.inter_attn = InterNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
-
-        self.W_V_self_msg = nn.ModuleDict({
-            str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
-            for l in range(max_degree + 1)
-        })
-
-        self.radial_V_msg: nn.ModuleDict = nn.ModuleDict()
-        for l in range(max_degree + 1):
-            for k in range(max_degree + 1):
-                key = f"{l}_{k}"
-                self.radial_V_msg[key] = nn.ModuleDict({
-                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
-                    for J in range(abs(l - k), l + k + 1)
-                })
-
-        self.cross_attn = CrossAttention(radial_net, max_degree, feature_dim, hidden_dim)
-
-        self.msg_to_phi: nn.ModuleDict = nn.ModuleDict()
-        for l in range(max_degree + 1):
-            for k in range(max_degree + 1):
-                key = f"{l}_{k}"
-                self.msg_to_phi[key] = nn.ModuleDict({
-                    str(J): nn.Linear((2 * k + 1) * feature_dim, 1, bias=False)
-                    for J in range(abs(l - k), l + k + 1)
-                })
-
-        self.layer_norm = nn.ModuleDict({
-            str(l): nn.LayerNorm(2 * l + 1)
-            for l in range(max_degree + 1)
-        })
-
-    def _intra_update(
-        self,
-        f_in:          Dict[int, torch.Tensor],  
-        x:             torch.Tensor,              
-        neighbor_idx:  torch.Tensor,             
-        neighbor_mask: torch.Tensor,           
-    ) -> Dict[int, torch.Tensor]:
-        N, K = neighbor_idx.shape
-
-        alpha = self.intra_attn(f_in, x, neighbor_idx, neighbor_mask)
-
-        x_i   = x.unsqueeze(1).expand(N, K, 3)
-        x_j   = x[neighbor_idx.view(-1)].view(N, K, 3)
-        x_rel = (x_j - x_i).reshape(N * K, 3)
-
-        f_j_flat: Dict[int, torch.Tensor] = {
-            l: f_in[l][neighbor_idx.view(-1)] for l in f_in
-        }
-
-        Wf_j_flat = apply_direct_sum_W(
-            f=f_j_flat, x=x_rel,
-            radial_nets=self.radial_V_intra,
-            max_degree=self.max_degree,
-        )
-
-        f_out: Dict[int, torch.Tensor] = {}
-        for l in range(self.max_degree + 1):
-            if l not in f_in:
-                continue
-            C = f_in[l].shape[1]
-            self_term    = self.W_V_self_intra[str(l)](f_in[l]) 
-            Wf_j         = Wf_j_flat[l].view(N, K, C, 2 * l + 1)
-            alpha_exp    = alpha.unsqueeze(-1).unsqueeze(-1)
-            neighbor_term = (alpha_exp * Wf_j).sum(dim=1)
-            f_out[l]     = self_term + neighbor_term
-
-        return f_out
-
-    def _message_update(
-        self,
-        m_in:          Dict[int, torch.Tensor],   
-        x_cm:          torch.Tensor,              
-        subgraph_mask: torch.Tensor,              
-    ) -> Dict[int, torch.Tensor]:
-        S = x_cm.shape[0]
-        C = m_in[0].shape[1]
-
-        beta = self.inter_attn(m_in, x_cm, subgraph_mask)     
-
-        x_cm_i = x_cm.unsqueeze(1).expand(S, S, 3)
-        x_cm_j = x_cm.unsqueeze(0).expand(S, S, 3)
-        x_rel  = (x_cm_j - x_cm_i).reshape(S * S, 3)
-
-        m_i_flat: Dict[int, torch.Tensor] = {
-            l: m_in[l].unsqueeze(0).expand(S, S, C, 2 * l + 1)
-               .reshape(S * S, C, 2 * l + 1)
-            for l in m_in
-        }
-
-        Wm_j_flat = apply_direct_sum_W(
-            f=m_i_flat, x=x_rel,
-            radial_nets=self.radial_V_msg,
-            max_degree=self.max_degree,
-        )
-
-        m_out: Dict[int, torch.Tensor] = {}
-        for l in range(self.max_degree + 1):
-            if l not in m_in:
-                continue
-            self_term    = self.W_V_self_msg[str(l)](m_in[l])
-            Wm_j         = Wm_j_flat[l].view(S, S, C, 2 * l + 1)
-            beta_exp     = beta.unsqueeze(-1).unsqueeze(-1)
-            neighbor_term = (beta_exp * Wm_j).sum(dim=1)
-            m_out[l]     = self_term + neighbor_term
-
-        return m_out
-
-    def _cross_update(
-        self,
-        f_out:           Dict[int, torch.Tensor], 
-        m_out:           Dict[int, torch.Tensor],  
-        x:               torch.Tensor,              
-        x_cm:            torch.Tensor,            
-        node_to_subgraph: torch.Tensor,        
-        subgraph_mask:   torch.Tensor,           
-    ) -> Dict[int, torch.Tensor]:
-        N = x.shape[0]
-        S = x_cm.shape[0]
-
-        gamma = self.cross_attn(
-            f_out, m_out, x, x_cm, node_to_subgraph, subgraph_mask
-        )  
-
-        x_i    = x.unsqueeze(1).expand(N, S, 3)
-        x_cm_j = x_cm.unsqueeze(0).expand(N, S, 3)
-        x_rel  = (x_cm_j - x_i).reshape(N * S, 3)   
-
-        f_updated: Dict[int, torch.Tensor] = {}
-
-        for l in f_out:
-            cross_contrib = torch.zeros_like(f_out[l])  
-
-            for k in m_out:
-                key = f"{l}_{k}"
-                if key not in self.msg_to_phi:
-                    continue
-
-                m_k      = m_out[k]         
-                phi_nets = self.msg_to_phi[key]
-                C_k      = m_k.shape[1]
-                dim_k    = 2 * k + 1
-
-                m_k_flat = m_k.reshape(S, C_k * dim_k)
-
-                for J_str, phi_net in phi_nets.items():
-                    J = int(J_str)
-                    
-                    phi_S  = phi_net(m_k_flat)                           
-                    phi_NS = phi_S.unsqueeze(0).expand(N, S, 1).reshape(N*S, 1)                     
-                
-                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS) 
-                    W    = W_NS.view(N, S, 2 * l + 1, 2 * k + 1)
-                
-                    Wf = torch.einsum("nsij,scj->nsci", W, m_k)   
-                
-                    gamma_exp     = gamma.unsqueeze(-1).unsqueeze(-1)   
-                    cross_contrib = cross_contrib + (gamma_exp * Wf).sum(dim=1)
-                    f_updated[l] = f_out[l] + cross_contrib
-
-        return f_updated
-
-    def forward(
-        self,
-        f_in:            Dict[int, torch.Tensor],
-        x:               torch.Tensor,
-        neighbor_idx:    torch.Tensor,
-        neighbor_mask:   torch.Tensor,
-        x_cm:            torch.Tensor,
-        node_to_subgraph: torch.Tensor,
-        subgraph_mask:   torch.Tensor,
-    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
-
-        f_out = self._intra_update(f_in, x, neighbor_idx, neighbor_mask)
-        num_subgraphs = x_cm.shape[0]
-        m_in = initial_message(f_out, node_to_subgraph, num_subgraphs)
-        for l, t in m_in.items():
-            assert t.shape[0] == num_subgraphs, \
-                f"initial_message degree {l}: shape[0]={t.shape[0]} != num_subgraphs={num_subgraphs}"
-        m_out = self._message_update(m_in, x_cm, subgraph_mask)
-        f_out = self._cross_update(f_out, m_out, x, x_cm,
-                                    node_to_subgraph, subgraph_mask)
-        return f_out, m_out
 
 def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
     """Return the CG matrix for a single J from the cached dict."""
@@ -312,7 +123,7 @@ def _equivariant_weight_single_J(
     had = phi * QTY                               
     return had.view(x.shape[0], 2 * l + 1, 2 * k + 1)
 
-class SE3InterNeighborhoodTransformer(nn.Module):
+class SE3BaseTransformer(nn.Module):
     def __init__(
         self,
         radial_net,
@@ -346,11 +157,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         self._graph_cache: Dict[str, tuple] = {}
 
         self.input_embedding = nn.Linear(in_features, feature_dim)
-
-        self.layers = nn.ModuleList([
-            SE3InterNeighborhoodLayer(radial_net, max_degree, feature_dim, hidden_dim)
-            for _ in range(num_layers)
-        ])
 
         if task == 0:
             self.readout = nn.Sequential(
@@ -469,12 +275,18 @@ class SE3InterNeighborhoodTransformer(nn.Module):
     
     def _seed_equivariant_features(
         self,
-        f0:    torch.Tensor,   
-        x:     torch.Tensor,  
-        batch: torch.Tensor,  
+        f0:            torch.Tensor,   
+        x:             torch.Tensor,  
+        atomic_masses: torch.Tensor,
+        batch:         torch.Tensor,  
     ) -> Dict[int, torch.Tensor]:
         B = int(batch.max().item()) + 1
-        center = scatter_mean(x, batch, dim=0, dim_size=B)    
+
+        m = atomic_masses.unsqueeze(-1)                                        # [N, 1]
+        mass_sum = torch_scatter.scatter_add(m, batch, dim=0, dim_size=B)      # [B, 1]
+        weighted_sum = torch_scatter.scatter_add(m * x, batch, dim=0, dim_size=B)  # [B, 3]
+        center = weighted_sum / mass_sum.clamp(min=1e-8)                        # [B, 3]
+
         x_rel  = x - center[batch]                              
 
         r     = x_rel.norm(dim=-1).clamp(min=1e-8)             
@@ -510,7 +322,7 @@ class SE3InterNeighborhoodTransformer(nn.Module):
         B = int(batch.max().item()) + 1
 
         f0 = self.input_embedding(node_features).unsqueeze(-1)       
-        seeded = self._seed_equivariant_features(f0, x, batch)
+        seeded = self._seed_equivariant_features(f0, x, atomic_masses, batch)
         f: Dict[int, torch.Tensor] = {0: f0, 1: seeded[1], 2: seeded[2]}
 
         ptr = [0]
@@ -619,7 +431,6 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             out_sh = self.readout(graph_embeddings)                       
             out    = torch.einsum('ij,bj->bi', self.sh1_to_cartesian, out_sh) 
             return out                        
-
         elif self.task == 2:
             tensor_features = f[2]                                        
             graph_embeddings = scatter_mean(
@@ -628,6 +439,287 @@ class SE3InterNeighborhoodTransformer(nn.Module):
             out_sh = self.readout(graph_embeddings)                            
             out    = torch.einsum('ij,bj->bi', self.sh2_to_cartesian, out_sh)   
             return out
+        else:
+            scalar_features  = f[0].squeeze(-1)                          
+            graph_embeddings0 = scatter_mean(
+                scalar_features, batch, dim=0, dim_size=B
+            )                                                              
+            out0 = self.readout(graph_embeddings0)
+
+            vector_features = f[1]                                   
+            graph_embeddings1 = scatter_mean(
+                vector_features, batch, dim=0, dim_size=B
+            )                                                          
+            out1_sh = self.readout(graph_embeddings1)                       
+            out1    = torch.einsum('ij,bj->bi', self.sh1_to_cartesian, out1_sh)
+
+            tensor_features = f[2]                                        
+            graph_embeddings2 = scatter_mean(
+                tensor_features, batch, dim=0, dim_size=B
+            )                                                                   
+            out2_sh = self.readout(graph_embeddings2)                            
+            out2    = torch.einsum('ij,bj->bi', self.sh2_to_cartesian, out2_sh)
+
+            return out0, out1, out2
+
+class SE3InterNeighborhoodLayer(nn.Module):
+    def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.max_degree  = max_degree
+        self.feature_dim = feature_dim
+        self.intra_attn  = IntraNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
+
+        self.W_V_self_intra = nn.ModuleDict({
+            str(l): IrrepLinear(2 * l + 1)
+            for l in range(max_degree + 1)
+        })
+
+        self.radial_V_intra: nn.ModuleDict = nn.ModuleDict()
+        for l in range(max_degree + 1):
+            for k in range(max_degree + 1):
+                key = f"{l}_{k}"
+                self.radial_V_intra[key] = nn.ModuleDict({
+                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
+                    for J in range(abs(l - k), l + k + 1)
+                })
+
+        self.inter_attn = InterNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
+
+        self.W_V_self_msg = nn.ModuleDict({
+            str(l): IrrepLinear(2 * l + 1)
+            for l in range(max_degree + 1)
+        })
+
+        self.radial_V_msg: nn.ModuleDict = nn.ModuleDict()
+        for l in range(max_degree + 1):
+            for k in range(max_degree + 1):
+                key = f"{l}_{k}"
+                self.radial_V_msg[key] = nn.ModuleDict({
+                    str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
+                    for J in range(abs(l - k), l + k + 1)
+                })
+
+        self.cross_attn = CrossAttention(radial_net, max_degree, feature_dim, hidden_dim)
+
+        self.msg_to_phi: nn.ModuleDict = nn.ModuleDict()
+        for l in range(max_degree + 1):
+            for k in range(max_degree + 1):
+                key = f"{l}_{k}"
+                self.msg_to_phi[key] = nn.ModuleDict({
+                    str(J): nn.Linear((2 * k + 1) * feature_dim, 1, bias=False)
+                    for J in range(abs(l - k), l + k + 1)
+                })
+
+        self.layer_norm = nn.ModuleDict({
+            str(l): nn.LayerNorm(2 * l + 1)
+            for l in range(max_degree + 1)
+        })
+
+    def _intra_update(
+        self,
+        f_in:          Dict[int, torch.Tensor],  
+        x:             torch.Tensor,              
+        neighbor_idx:  torch.Tensor,             
+        neighbor_mask: torch.Tensor,           
+    ) -> Dict[int, torch.Tensor]:
+        N, K = neighbor_idx.shape
+
+        alpha = self.intra_attn(f_in, x, neighbor_idx, neighbor_mask)
+
+        x_i   = x.unsqueeze(1).expand(N, K, 3)
+        x_j   = x[neighbor_idx.view(-1)].view(N, K, 3)
+        x_rel = (x_j - x_i).reshape(N * K, 3)
+
+        f_j_flat: Dict[int, torch.Tensor] = {
+            l: f_in[l][neighbor_idx.view(-1)] for l in f_in
+        }
+
+        Wf_j_flat = apply_direct_sum_W(
+            f=f_j_flat, x=x_rel,
+            radial_nets=self.radial_V_intra,
+            max_degree=self.max_degree,
+        )
+
+        f_out: Dict[int, torch.Tensor] = {}
+        for l in range(self.max_degree + 1):
+            if l not in f_in:
+                continue
+            C = f_in[l].shape[1]
+            self_term    = self.W_V_self_intra[str(l)](f_in[l]) 
+            Wf_j         = Wf_j_flat[l].view(N, K, C, 2 * l + 1)
+            alpha_exp    = alpha.unsqueeze(-1).unsqueeze(-1)
+            neighbor_term = (alpha_exp * Wf_j).sum(dim=1)
+            f_out[l]     = self_term + neighbor_term
+
+        return f_out
+
+    def _message_update(
+        self,
+        m_in:          Dict[int, torch.Tensor],   
+        x_cm:          torch.Tensor,              
+        subgraph_mask: torch.Tensor,              
+    ) -> Dict[int, torch.Tensor]:
+        S = x_cm.shape[0]
+        C = m_in[0].shape[1]
+
+        beta = self.inter_attn(m_in, x_cm, subgraph_mask)     
+
+        x_cm_i = x_cm.unsqueeze(1).expand(S, S, 3)
+        x_cm_j = x_cm.unsqueeze(0).expand(S, S, 3)
+        x_rel  = (x_cm_j - x_cm_i).reshape(S * S, 3)
+
+        mask_flat = subgraph_mask.reshape(S * S)  
+
+        m_j_flat: Dict[int, torch.Tensor] = {
+            l: m_in[l].unsqueeze(0).expand(S, S, C, 2 * l + 1)
+            .reshape(S * S, C, 2 * l + 1)
+            for l in m_in
+        }
+
+        # Defining unit vector to prevent masked entried from affecting autograd graph of x_cm nor affecting m_out
+        placeholder_dir = x_rel.new_tensor([0.0, 0.0, 1.0]).expand_as(x_rel)
+        safe_x_rel = torch.where(
+            mask_flat.unsqueeze(-1).expand_as(x_rel),
+            x_rel,
+            placeholder_dir,
+        )
+
+        Wm_j_flat = apply_direct_sum_W(
+            f=m_j_flat, x=safe_x_rel,
+            radial_nets=self.radial_V_msg,
+            max_degree=self.max_degree,
+        )
+
+        mask_grid = subgraph_mask.unsqueeze(-1).unsqueeze(-1) 
+
+        m_out: Dict[int, torch.Tensor] = {}
+        for l in range(self.max_degree + 1):
+            if l not in m_in:
+                continue
+            self_term     = self.W_V_self_msg[str(l)](m_in[l])
+            Wm_j          = Wm_j_flat[l].view(S, S, C, 2 * l + 1)
+            Wm_j          = torch.where(mask_grid, Wm_j, torch.zeros_like(Wm_j))
+            beta_exp      = beta.unsqueeze(-1).unsqueeze(-1)
+            neighbor_term = (beta_exp * Wm_j).sum(dim=1)
+            m_out[l]      = self_term + neighbor_term
+
+        return m_out
+
+    def _cross_update(
+        self,
+        f_out:           Dict[int, torch.Tensor], 
+        m_out:           Dict[int, torch.Tensor],  
+        x:               torch.Tensor,              
+        x_cm:            torch.Tensor,            
+        node_to_subgraph: torch.Tensor,        
+        subgraph_mask:   torch.Tensor,           
+    ) -> Dict[int, torch.Tensor]:
+        N = x.shape[0]
+        S = x_cm.shape[0]
+
+        gamma = self.cross_attn(
+            f_out, m_out, x, x_cm, node_to_subgraph, subgraph_mask
+        )  
+
+        x_i    = x.unsqueeze(1).expand(N, S, 3)
+        x_cm_j = x_cm.unsqueeze(0).expand(N, S, 3)
+        x_rel  = (x_cm_j - x_i).reshape(N * S, 3)   
+
+        f_updated: Dict[int, torch.Tensor] = {}
+
+        for l in f_out:
+            cross_contrib = torch.zeros_like(f_out[l])  
+
+            for k in m_out:
+                key = f"{l}_{k}"
+                if key not in self.msg_to_phi:
+                    continue
+
+                m_k      = m_out[k]         
+                phi_nets = self.msg_to_phi[key]
+                C_k      = m_k.shape[1]
+                dim_k    = 2 * k + 1
+
+                m_k_flat = m_k.reshape(S, C_k * dim_k)
+
+                for J_str, phi_net in phi_nets.items():
+                    J = int(J_str)
+                    
+                    phi_S  = phi_net(m_k_flat)                           
+                    phi_NS = phi_S.unsqueeze(0).expand(N, S, 1).reshape(N*S, 1)                     
+                
+                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS) 
+                    W    = W_NS.view(N, S, 2 * l + 1, 2 * k + 1)
+                
+                    Wf = torch.einsum("nsij,scj->nsci", W, m_k)   
+                
+                    gamma_exp     = gamma.unsqueeze(-1).unsqueeze(-1)   
+                    cross_contrib = cross_contrib + (gamma_exp * Wf).sum(dim=1)
+                    f_updated[l] = f_out[l] + cross_contrib
+
+        return f_updated
+
+    def forward(
+        self,
+        f_in:            Dict[int, torch.Tensor],
+        x:               torch.Tensor,
+        neighbor_idx:    torch.Tensor,
+        neighbor_mask:   torch.Tensor,
+        x_cm:            torch.Tensor,
+        node_to_subgraph: torch.Tensor,
+        subgraph_mask:   torch.Tensor,
+    ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+
+        f_out = self._intra_update(f_in, x, neighbor_idx, neighbor_mask)
+        num_subgraphs = x_cm.shape[0]
+        m_in = initial_message(f_out, node_to_subgraph, num_subgraphs)
+        for l, t in m_in.items():
+            assert t.shape[0] == num_subgraphs, \
+                f"initial_message degree {l}: shape[0]={t.shape[0]} != num_subgraphs={num_subgraphs}"
+        m_out = self._message_update(m_in, x_cm, subgraph_mask)
+        f_out = self._cross_update(f_out, m_out, x, x_cm,
+                                    node_to_subgraph, subgraph_mask)
+        return f_out, m_out
+
+class SE3InterNeighborhoodTransformer(SE3BaseTransformer):
+    def __init__(
+        self,
+        radial_net, 
+        in_features: int,
+        max_degree:  int = 2,
+        num_layers:  int = 4,
+        feature_dim: int = 32,
+        hidden_dim:  int = 64,
+        num_parts:   int = 4,
+        scalar_out_dim:     int = 19, # 3 for polarizability tensor type-0 component
+        task:        int = 0,
+        partition_type:             str = "spectral",
+        knn_k:                      int = 10,
+        use_bond_info:              bool = True,
+        bond_order_power:           float = 1.0,
+        use_connectivity_features:  bool = False,
+    ):
+        super().__init__(
+            radial_net=radial_net,
+            in_features=in_features,
+            max_degree=max_degree,
+            num_layers=num_layers,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_parts=num_parts,
+            scalar_out_dim=scalar_out_dim,
+            task=task,
+            partition_type=partition_type,
+            knn_k=knn_k,
+            use_bond_info=use_bond_info,
+            bond_order_power=bond_order_power,
+            use_connectivity_features=use_connectivity_features,
+        )
+        
+        self.layers = nn.ModuleList([
+            SE3InterNeighborhoodLayer(radial_net, max_degree, feature_dim, hidden_dim)
+            for _ in range(num_layers)
+        ])
  
 class SE3IntraOnlyLayer(nn.Module):
     def __init__(self, radial_net, max_degree: int, feature_dim: int, hidden_dim: int = 64):
@@ -726,7 +818,22 @@ class SE3IntraOnlyTransformer(SE3InterNeighborhoodTransformer):
         bond_order_power:           float = 1.0,
         use_connectivity_features:  bool = False,
     ):
-        super().__init__()
+        super().__init__(
+            radial_net=radial_net,
+            in_features=in_features,
+            max_degree=max_degree,
+            num_layers=num_layers,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_parts=num_parts,
+            scalar_out_dim=scalar_out_dim,
+            task=task,
+            partition_type=partition_type,
+            knn_k=knn_k,
+            use_bond_info=use_bond_info,
+            bond_order_power=bond_order_power,
+            use_connectivity_features=use_connectivity_features,
+        )
 
         self.layers = nn.ModuleList([
             SE3IntraOnlyLayer(radial_net, max_degree, feature_dim, hidden_dim)
