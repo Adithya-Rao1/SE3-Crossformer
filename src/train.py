@@ -1,14 +1,4 @@
 """
-train.py
---------
-Training loop and QM9 regression experiment (Section 4.2 of the manuscript).
-
-Usage:
-    python train.py --target 0 --num_parts 8 --max_degree 2 --epochs 300
-
-    # Effective batch size of 256 with physical batch size of 32:
-    python train.py --batch_size 32 --accum_steps 8 --target 0
-
 QM9 target indices (0-based, following torch_geometric convention):
     0:  mu      (dipole moment, D)
     1:  alpha   (isotropic polarizability, a0^3)
@@ -91,11 +81,6 @@ def one_hot_z(z: torch.Tensor) -> torch.Tensor:
 
 
 def _filter_small_graphs(batch, num_parts, device):
-    """
-    Drop graphs with fewer nodes than num_parts and remap indices.
-    Returns filtered tensors, or None if the whole batch is dropped.
-    Extracted as a helper so train_epoch and evaluate share the same logic.
-    """
     graph_batch = batch.batch.to(device)
     counts      = torch.bincount(graph_batch)
     valid_graph = counts >= num_parts
@@ -137,23 +122,10 @@ def _filter_small_graphs(batch, num_parts, device):
 
 def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch, 
                  monitor: SystemMonitor = None):
-    """
-    One training epoch with gradient accumulation.
-
-    Args:
-        accum_steps: number of micro-batches to accumulate before stepping.
-                     Effective batch size = loader.batch_size * accum_steps.
-                     Loss is averaged over the accumulated micro-batches so
-                     the gradient magnitude is independent of accum_steps.
-        monitor: optional SystemMonitor. If given, sample()d once per
-                 micro-batch and commit()ted once per accumulated step, so
-                 the recorded gpu/cpu/mem values are the mean over that
-                 step's micro-batches.
-    """
     model.train()
     total_loss  = 0.0
     n_graphs    = 0
-    accum_loss  = torch.tensor(0.0, device=device)  # running sum within window
+    accum_loss  = torch.tensor(0.0, device=device)  
 
     optimizer.zero_grad()
 
@@ -169,9 +141,6 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
             continue
 
         pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
-
-        # Divide loss by accum_steps so the accumulated gradient equals the
-        # gradient of the mean loss over the full effective batch.
         loss = nn.functional.l1_loss(pred.squeeze(-1), target) / accum_steps
         loss.backward()
 
@@ -181,7 +150,7 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
         accum_loss = accum_loss + loss.detach()
 
         B = pred.shape[0]
-        total_loss += loss.item() * accum_steps * B   # undo the /accum_steps for logging
+        total_loss += loss.item() * accum_steps * B   
         n_graphs   += B
 
         step_idx = i + 1
@@ -189,16 +158,13 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
             optimizer.step()
             optimizer.zero_grad()
 
-            # print(f"Batch {step_idx} | accum MAE: {accum_loss.item():.4f}")
             if monitor is not None:
                 monitor.commit(step_idx, accum_loss.item())
             accum_loss = torch.tensor(0.0, device=device)
-        # else:
-        #     print(f"Batch {step_idx} | micro-batch MAE: {loss.item() * accum_steps:.4f} "
-        #           f"({step_idx % accum_steps}/{accum_steps})")
+        else:
+            print(f"Batch {step_idx} | micro-batch MAE: {loss.item() * accum_steps:.4f} "
+                  f"({step_idx % accum_steps}/{accum_steps})")
 
-    # Flush any remaining accumulated gradients at epoch end (when
-    # len(loader) is not divisible by accum_steps).
     remainder = len(loader) % accum_steps
     if remainder != 0:
         optimizer.step()
@@ -233,7 +199,7 @@ def evaluate(model, loader, num_parts, device, epoch=None):
         B    = pred.shape[0]
         total_mae += mae * B
         n_graphs  += B
-        #print(f"[Eval Batch {i+1}] MAE: {mae:.4f}")
+        print(f"[Eval Batch {i+1}] MAE: {mae:.4f}")
 
     if epoch:
         print(f"Epoch: {epoch + 1} | Epoch Eval MAE: {total_mae/max(n_graphs, 1):.4f}")
@@ -336,8 +302,6 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                 partition_type=args.partition_type
             ).to(device)
 
-
-        
         optimizer = Adam(model.parameters(), lr=args.lr)
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
         monitor = SystemMonitor(device)
@@ -377,7 +341,6 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
 
     mean, hw = confidence_interval_95(trial_maes)
     print(f"\nTest MAE over {args.trials} trials: {mean:.4f} ± {hw:.4f}  (95% CI)")
-
 
 if __name__ == "__main__":
     main()
