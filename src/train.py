@@ -38,7 +38,7 @@ def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
         dtype=torch.float32,
     )
 
-def load_qm9(target_idx: int, batch_size=16, r: str = "./data", device=torch.device("cpu")):
+def load_qm9(batch_size=16, r: str = "./data", device=torch.device("cpu")):
     try:
         from torch_geometric.datasets import QM9
         from torch_geometric.loader import DataLoader
@@ -55,8 +55,6 @@ def load_qm9(target_idx: int, batch_size=16, r: str = "./data", device=torch.dev
         csv_file=r+"/qm9/raw/gdb9.sdf.csv",
         device=device,
     )
-
-    dataset.y = dataset.y[:, target_idx]
 
     idx1 = 110000
     idx2 = 120000
@@ -141,7 +139,7 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
             continue
 
         pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
-        loss = nn.functional.l1_loss(pred.squeeze(-1), target) / accum_steps
+        loss = nn.functional.l1_loss(pred, target) / accum_steps
         loss.backward()
 
         if monitor is not None:
@@ -273,7 +271,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
         elif args.rbf_type == "gsfb":
             radial_net = RadialNetworkGSFB
         else:
-            radial_net = RadialNetworkSFB
+            radial_net = RadialNetworkGSFB
 
         if args.model_type == "inter":
             model = SE3InterNeighborhoodTransformer(
@@ -284,8 +282,8 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                 feature_dim=args.feature_dim,
                 hidden_dim=args.hidden_dim,
                 num_parts=args.num_parts,
-                out_dim=19,
-                task="regression",
+                scalar_out_dim=19,
+                task=0,
                 partition_type=args.partition_type
             ).to(device)
         else:
@@ -297,8 +295,8 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                 feature_dim=args.feature_dim,
                 hidden_dim=args.hidden_dim,
                 num_parts=args.num_parts,
-                out_dim=19,
-                task="regression",
+                scalar_out_dim=19,
+                task=0,
                 partition_type=args.partition_type
             ).to(device)
 
