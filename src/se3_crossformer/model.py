@@ -91,7 +91,7 @@ class EquivariantReadout(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)   
+        x = x.transpose(-1, -2)   
         x = self.ll(x)          
         return x.squeeze(-1)   
 
@@ -444,20 +444,20 @@ class SE3BaseTransformer(nn.Module):
             graph_embeddings0 = scatter_mean(
                 scalar_features, batch, dim=0, dim_size=B
             )                                                              
-            out0 = self.readout(graph_embeddings0)
+            out0 = self.readout0(graph_embeddings0)
 
             vector_features = f[1]                                   
             graph_embeddings1 = scatter_mean(
                 vector_features, batch, dim=0, dim_size=B
             )                                                          
-            out1_sh = self.readout(graph_embeddings1)                       
+            out1_sh = self.readout1(graph_embeddings1)                       
             out1    = torch.einsum('ij,bj->bi', self.sh1_to_cartesian, out1_sh)
 
             tensor_features = f[2]                                        
             graph_embeddings2 = scatter_mean(
                 tensor_features, batch, dim=0, dim_size=B
             )                                                                   
-            out2_sh = self.readout(graph_embeddings2)                            
+            out2_sh = self.readout2(graph_embeddings2)                            
             out2    = torch.einsum('ij,bj->bi', self.sh2_to_cartesian, out2_sh)
 
             return out0, out1, out2
@@ -470,7 +470,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
         self.intra_attn  = IntraNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
 
         self.W_V_self_intra = nn.ModuleDict({
-            str(l): IrrepLinear(2 * l + 1)
+            str(l): IrrepLinear(feature_dim)
             for l in range(max_degree + 1)
         })
 
@@ -486,7 +486,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
         self.inter_attn = InterNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
 
         self.W_V_self_msg = nn.ModuleDict({
-            str(l): IrrepLinear(2 * l + 1)
+            str(l): IrrepLinear(feature_dim)
             for l in range(max_degree + 1)
         })
 
@@ -506,14 +506,9 @@ class SE3InterNeighborhoodLayer(nn.Module):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 self.msg_to_phi[key] = nn.ModuleDict({
-                    str(J): nn.Linear((2 * k + 1) * feature_dim, 1, bias=False)
+                    str(J): EquivariantReadout(feature_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
-
-        self.layer_norm = nn.ModuleDict({
-            str(l): nn.LayerNorm(2 * l + 1)
-            for l in range(max_degree + 1)
-        })
 
     def _intra_update(
         self,
@@ -640,12 +635,12 @@ class SE3InterNeighborhoodLayer(nn.Module):
                 C_k      = m_k.shape[1]
                 dim_k    = 2 * k + 1
 
-                m_k_flat = m_k.reshape(S, C_k * dim_k)
+                # m_k_flat = m_k.reshape(S, C_k * dim_k)
 
                 for J_str, phi_net in phi_nets.items():
                     J = int(J_str)
                     
-                    phi_S  = phi_net(m_k_flat)                           
+                    phi_S  = phi_net(m_k)                           
                     phi_NS = phi_S.unsqueeze(0).expand(N, S, 1).reshape(N*S, 1)                     
                 
                     W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS) 
@@ -742,11 +737,6 @@ class SE3IntraOnlyLayer(nn.Module):
                     str(J): radial_net(num_basis=(2 * l + 1), hidden_dim=hidden_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
-
-        self.layer_norm = nn.ModuleDict({
-            str(l): nn.LayerNorm(2 * l + 1)
-            for l in range(max_degree + 1)
-        })
  
     def _intra_update(
         self,

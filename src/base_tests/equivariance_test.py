@@ -10,8 +10,8 @@ from src.se3_crossformer.se3_utils import RadialNetworkGSFB
 
 torch.manual_seed(0)
 
-ATOL = 1e-3
-RTOL = 1e-3
+ATOL = 1e-4
+RTOL = 1e-4
 
 def random_rotation_matrix(dtype=torch.float32, generator=None) -> torch.Tensor:
     """Uniformly-ish sampled proper rotation matrix (det = +1) via QR."""
