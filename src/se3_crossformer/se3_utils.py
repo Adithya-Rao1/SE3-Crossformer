@@ -17,7 +17,7 @@ from e3nn import o3
 _CG_CACHE: Dict[Tuple[int, int], Dict[int, torch.Tensor]] = {}
 _SH_BASIS_CHANGE_CACHE: Dict[int, torch.Tensor] = {}
 
-def fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
+def fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-3) -> torch.Tensor:
     if l in _SH_BASIS_CHANGE_CACHE:
         return _SH_BASIS_CHANGE_CACHE[l]
 

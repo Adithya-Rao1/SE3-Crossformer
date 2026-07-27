@@ -9,6 +9,7 @@ import torch
 from scipy import stats
 
 from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB
 from src.train import load_qm9, _filter_small_graphs, ATOM_TYPES
 
 
@@ -22,6 +23,28 @@ def confidence_interval_95(values):
     t_crit = stats.t.ppf(0.975, df=n - 1)
     half_width = float(t_crit * std / math.sqrt(n))
     return mean, half_width
+
+
+def build_model(args, device):
+    if args.rbf_type == "grbf":
+        radial_net = RadialNetworkGRBF
+    elif args.rbf_type == "gsfb":
+        radial_net = RadialNetworkGSFB
+    else:
+        radial_net = RadialNetworkGSFB
+
+    return SE3InterNeighborhoodTransformer(
+        radial_net=radial_net,
+        in_features=len(ATOM_TYPES),
+        max_degree=args.max_degree,
+        num_layers=args.num_layers,
+        feature_dim=args.feature_dim,
+        hidden_dim=args.hidden_dim,
+        num_parts=args.num_parts,
+        scalar_out_dim=1,
+        task=0,
+        partition_type=args.partition_type,
+    ).to(device)
 
 
 @torch.no_grad()
@@ -69,11 +92,15 @@ def main():
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--rbf_type", type=str, default="gsfb",
+                         help="Must match the value used at training time.")
+    parser.add_argument("--partition_type", type=str, default="spectral",
+                         help="Must match the value used at training time.")
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--checkpoint_dir", type=str, default="/home/ubuntu/se3-crossformer-data/data",
-                         help="Directory containing best_model_trial{i}.pt files.")
+                         help="Directory containing best_model_trial{i}_target{t}.pt files.")
     parser.add_argument("--checkpoint_template", type=str,
-                         default="best_model_trial0.pt")
+                         default="best_model_trial{trial}_target{target}.pt")
     parser.add_argument("--data_root", type=str,
                          default="/home/ubuntu/se3-crossformer-data/data")
     parser.add_argument("--out_dir", type=str, default="./predictions_custom")
@@ -89,22 +116,14 @@ def main():
     trial_maes = []
     for trial in range(args.trials):
         ckpt_path = os.path.join(
-            args.checkpoint_dir, args.checkpoint_template.format(trial=trial)
+            args.checkpoint_dir,
+            args.checkpoint_template.format(trial=trial, target=args.target),
         )
         if not os.path.exists(ckpt_path):
             print(f"[trial {trial}] checkpoint not found at {ckpt_path}, skipping.")
             continue
 
-        model = SE3InterNeighborhoodTransformer(
-            in_features=len(ATOM_TYPES),
-            max_degree=args.max_degree,
-            num_layers=args.num_layers,
-            feature_dim=args.feature_dim,
-            hidden_dim=args.hidden_dim,
-            num_parts=args.num_parts,
-            out_dim=19,
-            task="regression",
-        ).to(device)
+        model = build_model(args, device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
         out_csv = os.path.join(args.out_dir, f"predictions_trial{trial}.csv")

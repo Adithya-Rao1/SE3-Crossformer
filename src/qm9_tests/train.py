@@ -46,15 +46,13 @@ def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
         dtype=torch.float32,
     )
 
-def load_qm9(target_index=1, batch_size=16, r: str = "./data", device=torch.device("cpu")):
+def load_qm9(batch_size=16, r: str = "./data", device=torch.device("cpu")):
     dataset = CustomQM9Dataset(
         root=r+"/qm1",
         sdf_file=r+"/qm9/raw/gdb9.sdf",
         csv_file=r+"/qm9/raw/gdb9.sdf.csv",
         device=device,
     )
-
-    dataset.y = dataset.y[:, target_index]
 
     idx1 = 110000
     idx2 = 120000
@@ -78,7 +76,7 @@ def one_hot_z(z: torch.Tensor) -> torch.Tensor:
     return one_hot
 
 
-def _filter_small_graphs(batch, num_parts, device):
+def _filter_small_graphs(target_idx, batch, num_parts, device):
     graph_batch = batch.batch.to(device)
     counts      = torch.bincount(graph_batch)
     valid_graph = counts >= num_parts
@@ -89,7 +87,7 @@ def _filter_small_graphs(batch, num_parts, device):
             batch.pos.to(device),
             batch.edge_index.to(device),
             get_atomic_masses(batch.x).to(device),
-            batch.y.to(device),
+            batch.y[:, target_idx].to(device),
             graph_batch,
         )
 
@@ -106,7 +104,7 @@ def _filter_small_graphs(batch, num_parts, device):
     pos         = batch.pos.to(device)[keep_nodes]
     atomic_mass = get_atomic_masses(batch.x).to(device)[keep_nodes]
     graph_batch = remap[graph_batch[keep_nodes]]
-    target      = batch.y.to(device)[keep_graphs]
+    target      = batch.y[:, target_idx].to(device)[keep_graphs]
 
     src, dst   = batch.edge_index.to(device)
     edge_mask  = keep_nodes[src] & keep_nodes[dst]
@@ -118,7 +116,7 @@ def _filter_small_graphs(batch, num_parts, device):
     return node_feat, pos, edge_index, atomic_mass, target, graph_batch
 
 
-def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch, 
+def train_epoch(target_idx, model, loader, optimizer, num_parts, device, accum_steps, epoch, 
                  monitor: SystemMonitor = None):
     model.train()
     total_loss  = 0.0
@@ -129,7 +127,7 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
 
     for i, batch in enumerate(loader):
         batch   = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts, device)
+        tensors = _filter_small_graphs(target_idx, batch, num_parts, device)
         if tensors is None:
             continue
 
@@ -139,7 +137,7 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
             continue
 
         pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
-        loss = nn.functional.l1_loss(pred, target) / accum_steps
+        loss = nn.functional.l1_loss(pred.squeeze(-1), target) / accum_steps
         loss.backward()
 
         if monitor is not None:
@@ -176,14 +174,14 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
 
 
 @torch.no_grad()
-def evaluate(model, loader, num_parts, device, epoch=None):
+def evaluate(target_idx, model, loader, num_parts, device, epoch=None):
     model.eval()
     total_mae = 0.0
     n_graphs  = 0
 
     for i, batch in enumerate(loader):
         batch   = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts, device)
+        tensors = _filter_small_graphs(target_idx, batch, num_parts, device)
         if tensors is None:
             continue
 
@@ -254,7 +252,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
     print(f"Effective batch:  {effective_batch}")
 
     train_loader, val_loader, test_loader = load_qm9(
-        args.target, args.batch_size, args.data_root, args.device
+        args.batch_size, args.data_root, args.device
     )
 
     trial_maes = []
@@ -309,10 +307,10 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
         for epoch in range(args.epochs):
             print(f"[Epoch {epoch + 1}]")
             train_loss = train_epoch(
-                model, train_loader, optimizer, args.num_parts, device,
+                args.target, model, train_loader, optimizer, args.num_parts, device,
                 accum_steps=args.accum_steps, epoch=epoch, monitor=monitor,
             )
-            val_mae = evaluate(model, val_loader, args.num_parts, device, epoch)
+            val_mae = evaluate(args.target, model, val_loader, args.num_parts, device, epoch)
             scheduler.step()
 
             if val_mae < best_val_mae:
@@ -334,7 +332,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
         )
 
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        test_mae = evaluate(model, test_loader, args.num_parts, device)
+        test_mae = evaluate(args.target, model, test_loader, args.num_parts, device)
         print(f"  Trial {trial + 1} test MAE: {test_mae:.4f}")
         trial_maes.append(test_mae)
 

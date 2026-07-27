@@ -16,7 +16,7 @@ from src.train import load_qm9, _filter_small_graphs
 
 ATOM_VOCAB = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}
 NUM_TOKENS = len(ATOM_VOCAB)
-NUM_EDGE_TOKENS = 5  
+NUM_EDGE_TOKENS = 5
 
 
 def confidence_interval_95(values):
@@ -51,16 +51,16 @@ class SE3RegressionWrapper(nn.Module):
 
     def forward(self, atoms, coors, mask, edges):
         per_atom = self.backbone(atoms, coors, mask, edges=edges, return_type=0)
-        per_atom = per_atom.squeeze(-1)  
+        per_atom = per_atom.squeeze(-1)
 
         mask_f = mask.float()
         pooled = (per_atom * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
-        pooled = pooled.unsqueeze(-1) 
+        pooled = pooled.unsqueeze(-1)
         return self.readout(pooled).squeeze(-1)
 
 
 def batch_to_dense(batch, device, max_nodes=None):
-    z = batch.x.long().to(device) 
+    z = batch.x.long().to(device)
     unknown = torch.tensor(
         [ATOM_VOCAB.get(int(zi), -1) for zi in z], device=device
     )
@@ -83,8 +83,9 @@ def batch_to_dense(batch, device, max_nodes=None):
 
     return atoms_dense, coors_dense, mask, edges_dense
 
+
 @torch.no_grad()
-def predict_and_record(model, loader, device, out_csv):
+def predict_and_record(model, loader, device, out_csv, min_nodes=4):
     model.eval()
     rows = []
     total_abs_err = 0.0
@@ -93,7 +94,7 @@ def predict_and_record(model, loader, device, out_csv):
 
     for batch in loader:
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts=1, device=device)
+        tensors = _filter_small_graphs(batch, min_nodes, device)
         if tensors is None:
             continue
         _, _, _, _, target, graph_batch = tensors
@@ -124,17 +125,23 @@ def predict_and_record(model, loader, device, out_csv):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=int, default=1)
+    parser.add_argument("--min_nodes", type=int, default=4,
+                         help="Drop graphs with fewer atoms than this. Set equal to "
+                              "the custom model's --num_parts for an apples-to-apples "
+                              "comparison over the same molecules.")
     parser.add_argument("--batch_size", type=int, default=16,
                          help="Dense (b, n, n) edge tensors are memory-heavy; "
                               "keep this smaller than the custom model's batch size.")
     parser.add_argument("--dim", type=int, default=32)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--num_degrees", type=int, default=2)
+    parser.add_argument("--dim_head", type=int, default=16)
+    parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--trials", type=int, default=5)
-    parser.add_argument("--checkpoint_dir", type=str, default="/home/ubuntu/se3-crossformer-data/se3-transformer-pytorch/se3_transformer_pytorch/data",
-                         help="Directory containing the authors' checkpoints.")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
+                         help="Directory containing authors_trial{i}_target{t}.pt files.")
     parser.add_argument("--checkpoint_template", type=str,
-                         default="/home/ubuntu/se3-crossformer-data/data/authors_trial0.pt")
+                         default="authors_trial{trial}_target{target}.pt")
     parser.add_argument("--data_root", type=str,
                          default="/home/ubuntu/se3-crossformer-data/data")
     parser.add_argument("--out_dir", type=str, default="./predictions_se3_transformer_pytorch")
@@ -150,20 +157,22 @@ def main():
     trial_maes = []
     for trial in range(args.trials):
         ckpt_path = os.path.join(
-            args.checkpoint_dir, args.checkpoint_template.format(trial=trial)
+            args.checkpoint_dir,
+            args.checkpoint_template.format(trial=trial, target=args.target),
         )
         if not os.path.exists(ckpt_path):
             print(f"[trial {trial}] checkpoint not found at {ckpt_path}, skipping.")
             continue
 
         model = SE3RegressionWrapper(
-            dim=args.dim, depth=args.depth, num_degrees=args.num_degrees
+            dim=args.dim, depth=args.depth, num_degrees=args.num_degrees,
+            dim_head=args.dim_head, heads=args.heads,
         ).to(device)
         state_dict = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state_dict, strict=False)  
+        model.load_state_dict(state_dict, strict=False)
 
         out_csv = os.path.join(args.out_dir, f"predictions_trial{trial}.csv")
-        mae = predict_and_record(model, test_loader, device, out_csv)
+        mae = predict_and_record(model, test_loader, device, out_csv, min_nodes=args.min_nodes)
         print(f"[trial {trial}] test MAE: {mae:.4f}  (predictions -> {out_csv})")
         trial_maes.append(mae)
 

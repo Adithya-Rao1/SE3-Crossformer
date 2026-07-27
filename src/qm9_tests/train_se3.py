@@ -105,6 +105,7 @@ def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
 
     return total_loss / max(n_graphs, 1)
 
+
 @torch.no_grad()
 def evaluate(model, loader, device, min_nodes, empty_cache_every=1):
     model.eval()
@@ -228,7 +229,7 @@ def main():
         monitor = SystemMonitor(device)
 
         ckpt_path = os.path.join(
-            args.checkpoint_dir, args.checkpoint_template.format(trial=trial)
+            args.checkpoint_dir, args.checkpoint_template.format(trial=trial, target=args.target)
         )
 
         best_val_mae = float("inf")
