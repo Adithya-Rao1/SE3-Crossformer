@@ -20,39 +20,106 @@ This work is originally inspired by the success of the SE(3) transformer. The pr
 Thus, we propose adding an inter-neighborhood attention term that aggregates neighborhood feature representations and uses SE(3) equivariant EGNN (which acts as an MPNN) to relay this information to contribute to the update of each node feature vector. 
 
 \subsection{Methodology}
-We begin by defining a graph $\mathcal{G} = \{\mathcal{V}, \mathcal{E}\}$ where $\mathcal{V}$ denotes the set of nodes and $\mathcal{E}$ the set of edges. Each node $i$ and edge $ij$ will have with them an associated set of node and edge features $\mathbf{f}_i$. We seek to then predict properties of the graph by predicting these features. The local nodes will be the 3D coordinates of each atom. The local edges will be the one-hot encoded bonds between an atom $i$ and atom $j$ for all atoms $j \in \mathcal{N}_i$. Then, the feature vector of node and edge features will live in the d-dimensional real Euclidean space  such that $\mathbf{f}_i \in \mathbb{R}^d$ Neighborhoods will be constructed using the spectral graph decomposition algorithm outlined in the paper by Elden. Suppose this process yields $k$ subgraphs. For each node $i \in \mathcal{N}_j, \quad j \in \{1, \dots, k\}$, we calculate the feature update using the original mechanism proposed in the SE(3)-Transformer paper so that:
-\[
+We begin by defining a graph $\mathcal{G} = \{\mathcal{V}, \mathcal{E}\}$ where $\mathcal{V}$ denotes the set of nodes and $\mathcal{E}$ the set of edges. Each node $i$ and edge $ij$ will have with them an associated set of node and edge features $\mathbf{f}_i$. We seek to then predict properties of the graph by predicting these features. The local nodes will be the 3D coordinates of each atom. The local edges will be the one-hot encoded bonds between an atom $i$ and atom $j$ for all atoms $j \in \mathcal{N}_i$. Then, the feature vector of node and edge features will live in the d-dimensional real Euclidean space  such that $\mathbf{f}_i \in \mathbb{R}^d$ Neighborhoods will be constructed using the spectral graph decomposition algorithm outlined in the paper by Elden. Suppose this process yields $k$ subgraphs. For each node $i \in \mathcal{N}_j, \quad j \in \{1, \dots, k\}$, we calculate the feature update using the original mechanism proposed in the SE(3)-Transformer paper:
+\begin{equation}
 \mathbf{f}_{\text{out},i}^\ell = \mathbf{W}_V^{\ell \ell}\mathbf{f}_{\text{in},i}^\ell + \sum_{k \geq 0} \sum_{j \in \mathcal{N}_i \backslash i} \alpha_{ij} \mathbf{W}_V^{\ell k}(\mathbf{x}_j -\mathbf{x}_i)\mathbf{f}_{\text{in},j}^k
-\]
+\end{equation}
 \noindent
 We do this for all nodes in the subgraph. Then, we construct a learnable message of the subgraph $i$ as the following:
-\[
+\begin{equation}
 \mathbf{m}_{\text{out},i}^\ell =\mathbf{W}^{\ell \ell}_V \mathbf{m}_{\text{in}, i} + \sum_{k \geq 0} \sum_{j \in \mathcal{C}_i \backslash i} \beta_{ij}\mathbf{W}^{\ell k}_V(\mathbf{x}_{\text{CM}, j } - \mathbf{x}_{\text{CM}, i})\mathbf{m}_{\text{in},i}^\ell
-\]
+\end{equation}
 \noindent 
 where 
-\[
-\mathbf{x}_{\text{CM}, b} = \frac{\sum_{i=1}^{N_b} m_i\mathbf{x}_i}{\sum_{i=1}^{N_b} m_i}
-\quad \mathbf{m}_{\text{in}, i}^{\ell=1} = \frac{1}{N_{\mathcal{N}_i}} \sum_{i \in \mathcal{N}_i}\mathbf{f}_{\text{out},i}^{\ell = 1}
-\]
-\noindent 
-$m_i$ is the atomic mass of atom $i$, and $\mathcal{C}_j \backslash j$ is the set of all neighborhood except the $j$-th one. Therefore, we define the inter-neighborhood graph edges as the distances connecting the center of masses of each neighborhood. The motivation behind this is to give stronger weight to the neighborhood messages that are closer to some node $i$ in subgraph $j$ since long-range chemical and electrical interactions fall off with distances. Furthermore, similar to the learnable weight matrices, $\mathbf{m_i}$ will be a $(2J + 1) \times (2J + 1)$ matrix that will be decomoposed into a the product of the corresponding Clebsch-Gordan coefficients times the direct sum of the orthonormal spherical harmonics functions evaluated at $\mathbf{x_i}$ for $\mathbf{m}_i$ to preserve equivariance once it acts on the feature vectors. Then, consider subgraph $i$, we update each node $i \in \mathcal{N}_i$ by the following:
-\[
+\begin{align}
+\mathbf{x}_{\text{CM}, b} &= \frac{\sum_{i=1}^{N_b} m_i\mathbf{x}_i}{\sum_{i=1}^{N_b} m_i} \\
+\quad \mathbf{m}_{\text{in}, i}^{\ell} &= \frac{1}{N_{\mathcal{N}_i}} \sum_{i \in \mathcal{N}_i}\mathbf{f}_{\text{out},i}^{\ell}
+\end{align}
+Here, $m_i$ is the atomic mass of atom $i$, and $\mathcal{C}_j \backslash j$ is the set of all neighborhood except the $j$-th one. Furthermore, the subgraph messages are also initialized to be of degree 0, 1, or 2. The model will encode subgraph-level scalar values such as energy using the type-0 features. On the other hand, the prediction of IR spectra necessitates a Fast Fourier Transform on the time derivatives of the dipole moment as
+\begin{equation}
+    I_{IR}(\omega) \propto \int \langle \mathbf{\dot{\mu}}(\tau), \mathbf{\dot{\mu}}(\tau + t) \rangle_\tau e^{-i \omega t}dt
+\end{equation}
+Where $\omega$ is vibrational frequency, $\tau$ is the time lag, $\mathbf{\dot{\mu}}$ is the time derivative of the dipole moment. Thus, these will be represented through type-1 features. For predicting Raman spectra, a useful property of the system to predict is the Placzek-type polarizability tensor $\alpha$ which is defined as $\mathbf{p} = \alpha \mathbf{E}$ where $\mathbf{p}$ is the dipole moment and $\mathbf{E}$ is the electric field. Using this, the Raman spectra can be calculated by
+\begin{equation}
+    I_\text{Raman}(\omega) \propto \frac{(\omega_\text{in} - \omega)^4}{\omega} \frac{1}{1 - \exp(-\frac{\hbar \omega}{k_B T})}S(a^2, \gamma^2)
+\end{equation}
+Here, $S(a^2, \gamma^2)$ is a combination of isotropic and anisotropic invariants of $\alpha$, $\omega$ is the vibrational frequency, $\omega_{in}$ is the frequency of the incident light, $k_B$ is the Boltzmann constant, and $T$ is the temperature. Therefore, $\ell=2$ for this property to propagate the correspondingly transformed object. 
+\\\\ 
+ Therefore, we define the inter-neighborhood graph edges as the distances connecting the center of masses of each neighborhood. The motivation behind this is to give stronger weight to the neighborhood messages that are closer to some node $i$ in subgraph $j$ since long-range chemical and electrical interactions fall off with distances. Furthermore, similar to the learnable weight matrices, $\mathbf{m_i}$ will be a $(2J + 1) \times (2J + 1)$ matrix that will be decomoposed into a the product of the corresponding Clebsch-Gordan coefficients times the direct sum of the orthonormal spherical harmonics functions evaluated at $\mathbf{x_i}$ for $\mathbf{m}_i$ to preserve equivariance once it acts on the feature vectors. Then, consider subgraph $i$, we update each node $i \in \mathcal{N}_i$ by the following:
+\begin{equation}
 \mathbf{f}_{\text{out}, i}^\ell = \mathbf{f}_{\text{out}, i}^\ell + \sum_{a \geq 0} \sum_{b \in \mathcal{C}_i \backslash i} \gamma_{ij} \mathbf{m}_b(\mathbf{x}_{\text{CM},b} - \mathbf{x}_i)\mathbf{f}_{\text{out}, i}^\ell
-\]
+\end{equation}
 \noindent
 In the equations above, there are 3 sets of attention weights $\alpha_{ij}, \beta_{ij}, \gamma_{ij}$ which represents the information correspondence of feature-feature, neighborhood-neighborhood, and neighborhood-feature, respectively. Thus, they are constructed as follows:
 \begin{align}
-    \alpha_{ij} &= \frac{\exp(\mathbf{q}_i^T\mathbf{k}_{ij})}{\sum_{j \in \mathcal{N}_i \backslash i} \exp(\mathbf{q}_i^T\mathbf{k}_{ij})}, \quad \mathbf{q}_i = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_Q^{\ell k} \mathbf{f}_{\text{in},i}^k, \quad \mathbf{k}_{ij} = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_K^{\ell k}(\mathbf{x}_j - \mathbf{x}_i) \mathbf{f}_{\text{in},j}^k \notag \\
-    \beta_{ij} &= \frac{\exp(\mathbf{q}_{m,i}^T\mathbf{k}_{m,ij})}{\sum_{j \in \mathcal{C}_i \backslash i} \exp(\mathbf{q}_{m,i}^T\mathbf{k}_{m, ij})}, \quad \mathbf{q}_i = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_Q^{\ell k} \mathbf{m}_{\text{in},i}^k, \quad \mathbf{k}_{ij} = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_K^{\ell k}(\mathbf{x}_{\text{CM},j} - \mathbf{x}_{\text{CM},i}) \mathbf{m}_{\text{in},j}^k \notag \\
-    \gamma_{ij} &= \frac{\exp(\mathbf{q}_{i}^T\mathbf{k}_{m, ij})}{\sum_{j \in \mathcal{C}_i \backslash i} \exp(\mathbf{q}_{i}^T\mathbf{k}_{m, ij})}, \quad \mathbf{q}_i = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_Q^{\ell k} \mathbf{f}_{\text{in},i}^k, \quad \mathbf{k}_{ij} = \bigoplus_{\ell \geq 0} \sum_{k \geq 0}\mathbf{W}_K^{\ell k}(\mathbf{x}_{\text{CM},j} - \mathbf{x}_{\text{CM},i}) \mathbf{m}_{\text{in},j}^k \notag \\
+\alpha_{ij}
+&=
+\frac{\exp(\mathbf{q}_i^T \mathbf{k}_{ij})}
+     {\sum_{j \in \mathcal{N}_i \backslash i}
+      \exp(\mathbf{q}_i^T \mathbf{k}_{ij})},
+&
+\mathbf{q}_i
+&=
+\bigoplus_{\ell \geq 0}
+\sum_{k \geq 0}
+\mathbf{W}_Q^{\ell k}
+\mathbf{f}_{\mathrm{in},i}^{k},
+&
+\mathbf{k}_{ij}
+&=
+\bigoplus_{\ell \geq 0}
+\sum_{k \geq 0}
+\mathbf{W}_K^{\ell k}(\mathbf{x}_j-\mathbf{x}_i)
+\mathbf{f}_{\mathrm{in},j}^{k},
+\\[0.5em]
+\beta_{ij}
+&=
+\frac{\exp(\mathbf{q}_{m,i}^T \mathbf{k}_{m,ij})}
+     {\sum_{j \in \mathcal{C}_i \backslash i}
+      \exp(\mathbf{q}_{m,i}^T \mathbf{k}_{m,ij})},
+&
+\mathbf{q}_{m,i}
+&=
+\bigoplus_{\ell \geq 0}
+\sum_{k \geq 0}
+\mathbf{W}_Q^{\ell k}
+\mathbf{m}_{\mathrm{in},i}^{k},
+&
+\mathbf{k}_{m,ij}
+&=
+\bigoplus_{\ell \geq 0}
+\sum_{k \geq 0}
+\mathbf{W}_K^{\ell k}
+(\mathbf{x}_{\mathrm{CM},j}-\mathbf{x}_{\mathrm{CM},i})
+\mathbf{m}_{\mathrm{in},j}^{k},
+\\[0.5em]
+\gamma_{ij}
+&=
+\frac{\exp(\mathbf{q}_{i}^T \mathbf{k}_{m,ij})}
+     {\sum_{j \in \mathcal{C}_i \backslash i}
+      \exp(\mathbf{q}_{i}^T \mathbf{k}_{m,ij})},
+&
+\mathbf{q}_{i}
+&=
+\bigoplus_{\ell \geq 0}
+\sum_{k \geq 0}
+\mathbf{W}_Q^{\ell k}
+\mathbf{f}_{\mathrm{in},i}^{k},
+&
+\mathbf{k}_{m,ij}
+&=
+\bigoplus_{\ell \geq 0}
+\sum_{k \geq 0}
+\mathbf{W}_K^{\ell k}
+(\mathbf{x}_{\mathrm{CM},j}-\mathbf{x}_{\mathrm{CM},i})
+\mathbf{m}_{\mathrm{in},j}^{k}.
 \end{align}
 
 Next, to ensure the learnable weight matrices $\mathbf{W}$ maintain equivariance when acting upon the $SO(3)$-transformed feature vectors $\mathbf{f}$, they must satisfy
 \begin{align}
-\mathbf{W}^{\ell k}(\mathbf{x}) &= \text{unvec}\Big( \mathbf{Q}^{\ell k \text{T}} \bigoplus_{J = |k-\ell|}^{k + \ell} \phi_J^{\ell k}(||\mathbf{x}||)\mathbf{Y}_J(\mathbf{x}) \Big) \notag
+\mathbf{W}^{\ell k}(\mathbf{x}) &= \text{unvec}\Big( \mathbf{Q}^{\ell k \text{T}} \bigoplus_{J = |k-\ell|}^{k + \ell} \phi_J^{\ell k}(||\mathbf{x}||)\mathbf{Y}_J(\mathbf{x}) \Big)
 \\
-&= \sum_{J = |k-\ell|}^{k + \ell} \phi_J^{\ell k}(||\mathbf{x}||)\text{unvec}\big( \mathbf{Q}^{\ell k \text{T}}\mathbf{Y}_J(\mathbf{x}) \big) \notag
+&= \sum_{J = |k-\ell|}^{k + \ell} \phi_J^{\ell k}(||\mathbf{x}||)\text{unvec}\big( \mathbf{Q}^{\ell k \text{T}}\mathbf{Y}_J(\mathbf{x}) \big) 
 \end{align}
 
 \noindent

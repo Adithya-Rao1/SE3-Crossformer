@@ -52,7 +52,7 @@ def mol_to_graph(mol) -> Tuple[torch.Tensor, int]:
     return edge_index, mol.GetNumAtoms()
 
 def knn_partition(
-    pos: np.ndarray,     # [N, 3]
+    pos: np.ndarray,    
     num_parts: int,
     k: int,
 ) -> np.ndarray:
@@ -61,13 +61,11 @@ def knn_partition(
     return kmeans.fit_predict(pos)
 
 def partition_boundary_distance(
-    partition: np.ndarray,        # [N] int cluster labels
+    partition: np.ndarray,       
     reference_groups: List[frozenset],
     N: int,
 ) -> float:
     """
-    Compute the average Jaccard distance between the partition's clusters and the nearest reference functional group.
-
     TODO: May need more rigorous/meaningful "boundary distance" metric
     """
     if not reference_groups:
@@ -83,7 +81,7 @@ def partition_boundary_distance(
             union = len(group | cluster_set)
             jaccard = inter / union if union > 0 else 0.0
             best_jaccard = max(best_jaccard, jaccard)
-        distances.append(1.0 - best_jaccard)   # Jaccard distance
+        distances.append(1.0 - best_jaccard)  
 
     return float(np.mean(distances))
 
@@ -118,13 +116,12 @@ def main():
             break
 
         # TODO: ZINC torch_geometric data does not store SMILES directly in all versions. Add feature to get SMILES
-
         N = data.num_nodes
         if N < args.num_parts:
             skipped += 1
             continue
 
-        edge_index = data.edge_index   # [2, E]
+        edge_index = data.edge_index  
 
         try:
             sp_labels = spectral_partition(edge_index, N, args.num_parts).numpy()

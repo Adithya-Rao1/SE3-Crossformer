@@ -8,7 +8,7 @@ from torch_geometric.datasets import QM9, ZINC
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch
 
-from atomic_datasets import GEOMDrugs
+# from atomic_datasets import GEOMDrugs
 
 import pandas as pd
 from rdkit import Chem
@@ -16,29 +16,17 @@ from tqdm import tqdm
 from torch_geometric.data import Data, InMemoryDataset
 
 class CustomQM9Dataset(InMemoryDataset):
-    """
-    Custom QM9 parser that loads:
-        - atom features
-        - bond features
-        - 3D coordinates
-        - all QM9 targets
-
-    Output:
-        x           [num_atoms, 3]
-        edge_index  [2, num_edges]
-        edge_attr   [num_edges, 1]
-        pos         [num_atoms, 3]
-        y           [1, num_targets]
-    """
-
     def __init__(
         self,
         root,
         sdf_file,
         csv_file,
+        device,
         transform=None,
         pre_transform=None,
     ):
+        self.device = device
+
         self.sdf_file = sdf_file
         self.csv_file = csv_file
 
@@ -96,10 +84,6 @@ class CustomQM9Dataset(InMemoryDataset):
             )
         ):
 
-            ############################
-            # Atom features
-            ############################
-
             atom_features = []
 
             for atom in mol.GetAtoms():
@@ -110,12 +94,9 @@ class CustomQM9Dataset(InMemoryDataset):
 
             x = torch.tensor(
                 atom_features,
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             )
-
-            ############################
-            # Edges
-            ############################
 
             rows = []
             cols = []
@@ -143,31 +124,26 @@ class CustomQM9Dataset(InMemoryDataset):
 
             edge_index = torch.tensor(
                 [rows, cols],
-                dtype=torch.long
+                dtype=torch.long,
+                device=self.device
             )
 
             edge_attr = torch.tensor(
                 edge_features,
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             )
-
-            ############################
-            # Coordinates
-            ############################
 
             conf = mol.GetConformer()
 
             pos = torch.tensor(
                 conf.GetPositions(),
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             )
 
             if pos.shape[0] != x.shape[0]:
                 continue
-
-            ############################
-            # Targets
-            ############################
 
             target_values = [
                 float(v)
@@ -176,12 +152,9 @@ class CustomQM9Dataset(InMemoryDataset):
 
             y = torch.tensor(
                 target_values,
-                dtype=torch.float
+                dtype=torch.float,
+                device=self.device
             ).reshape(1, -1)
-
-            ############################
-            # Build Data object
-            ############################
 
             data = Data(
                 x=x,
@@ -192,10 +165,6 @@ class CustomQM9Dataset(InMemoryDataset):
             )
 
             data_list.append(data)
-
-        ############################
-        # Optional transform
-        ############################
 
         if self.pre_transform is not None:
             data_list = [
@@ -210,7 +179,6 @@ class CustomQM9Dataset(InMemoryDataset):
             self.processed_paths[0]
         )
 
-
 def to_tensor(x):
     if torch.is_tensor(x):
         return x
@@ -220,16 +188,11 @@ def to_tensor(x):
         return torch.tensor(x)
     return x
 
-
 def sanitize_data(data):
-    """
-    Recursively convert numpy arrays in a PyG Data object to torch tensors.
-    """
     for key, value in data.items():
         if isinstance(value, np.ndarray):
             data[key] = torch.from_numpy(value)
         elif isinstance(value, list):
-            # handle list of arrays (common in GEOM conformers)
             if len(value) > 0 and isinstance(value[0], np.ndarray):
                 data[key] = [torch.from_numpy(v) for v in value]
             else:
@@ -240,7 +203,6 @@ def sanitize_data(data):
 
 
 def geom_collate_fn(batch):
-    # batch = list[Data]
     return [sanitize_data(data) for data in batch]
 
 config = {
@@ -263,24 +225,8 @@ def load_data(dataset_type, config):
             dataset = ZINC(root='./data/zinc')
         loader = DataLoader(dataset=dataset,
                             **config)
-    elif dataset_type == "geom":
+    """elif dataset_type == "geom":
         dataset = GEOMDrugs(root_dir="data/geom")
-        loader = TorchLoader(dataset, **config, collate_fn=geom_collate_fn)
+        loader = TorchLoader(dataset, **config, collate_fn=geom_collate_fn)"""
     
     return loader
-
-"""geom_loader = load_data("geom", config)
-for batch in geom_loader:
-    print(Chem.MolFromSmiles(batch[0]['properties']['smiles']))
-    break"""
-"""
-qm9_loader = load_data("qm9", config)
-
-for batch in qm9_loader:
-    print
-    print(batch)
-    break"""
-
-
-
-
