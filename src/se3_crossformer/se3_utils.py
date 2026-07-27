@@ -17,7 +17,7 @@ from e3nn import o3
 _CG_CACHE: Dict[Tuple[int, int], Dict[int, torch.Tensor]] = {}
 _SH_BASIS_CHANGE_CACHE: Dict[int, torch.Tensor] = {}
 
-def _fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
+def fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
     if l in _SH_BASIS_CHANGE_CACHE:
         return _SH_BASIS_CHANGE_CACHE[l]
 
@@ -46,12 +46,12 @@ def clebsch_gordan_matrix(l: int, k: int) -> Dict[int, torch.Tensor]:
     if (l, k) in _CG_CACHE:
         return _CG_CACHE[(l, k)]
 
-    U_l = _fit_sh_basis_change(l).to(torch.float64)
-    U_k = _fit_sh_basis_change(k).to(torch.float64)
+    U_l = fit_sh_basis_change(l).to(torch.float64)
+    U_k = fit_sh_basis_change(k).to(torch.float64)
 
     result: Dict[int, torch.Tensor] = {}
     for J in range(abs(l - k), l + k + 1):
-        U_J = _fit_sh_basis_change(J).to(torch.float64)
+        U_J = fit_sh_basis_change(J).to(torch.float64)
 
         w3j     = o3.wigner_3j(l, k, J).to(torch.float64)                  
         Q_e3nn  = w3j.reshape((2 * l + 1) * (2 * k + 1), 2 * J + 1)        
@@ -383,9 +383,6 @@ def verify_cg_orthogonality(max_degree: int = 2, tol: float = 1e-5) -> None:
             "One or more CG matrices failed the orthogonality check."
         )
 
-def _cartesian_dipole(n: torch.Tensor) -> torch.Tensor:
-    return n
-
 def fit_sh_to_cartesian(l: int, target_fn, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
     n = torch.randn(n_samples, 3, dtype=torch.float64)
     n = n / n.norm(dim=-1, keepdim=True)
@@ -445,7 +442,7 @@ def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
     from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
     return clebsch_gordan_matrix(l, k)[J]
 
-def _equivariant_weight_single_J(
+def equivariant_weight_single_J(
     x:   torch.Tensor,  
     l:   int,
     k:   int,

@@ -29,7 +29,6 @@ def run_num_workers_experiment(
         device   = torch.device("cpu"),
     )
     dataset.y = dataset.y[:, args.target]
-    # Use only a slice for speed
     subset_size = min(len(dataset), num_batches * args.batch_size * 4)
     dataset = dataset[:subset_size]
 

@@ -23,6 +23,18 @@ from src.se3_crossformer.knn_partition import knn_partition
 from src.se3_crossformer.spherical_harm import get_spherical_harmonics
 from src.se3_crossformer.se3_utils import *
 
+def _cartesian_dipole(n: torch.Tensor) -> torch.Tensor:
+    return n
+
+def _cartesian_quadrupole(n: torch.Tensor) -> torch.Tensor:
+    X, Y, Z = n[:, 0], n[:, 1], n[:, 2]
+    Qxx = X * X - 1.0 / 3.0
+    Qyy = Y * Y - 1.0 / 3.0
+    Qxy = X * Y
+    Qxz = X * Z
+    Qyz = Y * Z
+    return torch.stack([Qxx, Qxy, Qxz, Qyy, Qyz], dim=-1)
+
 if os.path.exists("sh1_cartesian.pt"):
     SH1_TO_CARTESIAN = torch.load("sh1_cartesian.pt")
 else:
@@ -553,7 +565,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
                     phi_S  = phi_net(m_k)                                 
                     phi_NS = phi_S.unsqueeze(0).expand(N, S).reshape(N * S, 1)
 
-                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS)
+                    W_NS = equivariant_weight_single_J(x_rel, l, k, J, phi_NS)
                     W    = W_NS.view(N, S, 2 * l + 1, 2 * k + 1)
 
                     Wf = torch.einsum("nsij,scj->nsci", W, m_k)
