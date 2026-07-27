@@ -165,9 +165,6 @@ def test_polarizability_combined_rotation_and_translation(model_cls):
 
 @pytest.mark.parametrize("model_cls", POLARIZABILITY_MODEL_CLASSES)
 def test_polarizability_output_is_symmetric(model_cls):
-    """Structural sanity check independent of SE(3) transforms: the
-    polarizability tensor is built as iso*I + a traceless-symmetric
-    anisotropic part, so it should always come out symmetric."""
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
         n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=13
@@ -179,8 +176,6 @@ def test_polarizability_output_is_symmetric(model_cls):
 
 @pytest.mark.parametrize("model_cls", POLARIZABILITY_MODEL_CLASSES)
 def test_polarizability_batched_combined_transform(model_cls):
-    """Two independent graphs in one batch, both transformed by the same
-    R/t -- exercises the multi-graph pooling/padding path."""
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_two_graph_batch(
         n_atom_types=n_atom_types, num_parts=4

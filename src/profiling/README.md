@@ -200,31 +200,6 @@ sh_accesses_per_sec                 → Estimated spherical harmonic compute rat
 
 ---
 
-## Output files
-
-```
-profiling_results/
-├── profile_<ts>.json              # All numeric results
-├── profile_<ts>.log               # Full console log
-├── torch_profiler/                # TensorBoard trace files
-├── torch_profiler_trace.json      # Chrome trace (open in chrome://tracing)
-├── gpu_dmon_<ts>.log              # nvidia-smi dmon raw output
-├── gpu_snapshots_<ts>.log         # nvidia-smi periodic snapshots
-├── cpu_util_<ts>.log              # mpstat per-core output
-└── plots_<ts>/
-    ├── 01_timing_breakdown.png
-    ├── 02_gpu_utilisation.png
-    ├── 04_dataloader.png
-    ├── 05_num_workers.png
-    ├── 06_batch_scaling.png
-    ├── 08_graph_construction.png
-    ├── 09_forward_breakdown.png
-    ├── 10_torch_profiler_top_ops.png
-    └── 11_throughput.png
-```
-
----
-
 ## Common fixes (based on expected findings)
 
 | Finding | Likely fix |

@@ -23,9 +23,6 @@ def random_rotation_matrix(dtype=torch.double, generator=None) -> torch.Tensor:
     return Q.to(dtype)
 
 def qvec_to_matrix(q: torch.Tensor) -> torch.Tensor:
-    """
-    Convert the 5-component traceless symmetric quadrupole representation into a full symmetric traceless matrix.
-    """
     Qxx, Qxy, Qxz, Qyy, Qyz = q.unbind(-1)
     Qzz = -Qxx - Qyy
     row0 = torch.stack([Qxx, Qxy, Qxz], dim=-1)

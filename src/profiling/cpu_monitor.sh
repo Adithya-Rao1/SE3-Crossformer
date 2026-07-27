@@ -1,23 +1,6 @@
-#!/usr/bin/env bash
-# cpu_monitor.sh
-# ──────────────
-# Experiment 7: CPU utilisation snapshot.
-#
-# Usage:
-#   chmod +x profiling/cpu_monitor.sh
-#   ./profiling/cpu_monitor.sh [output_dir] [interval_seconds] [duration_seconds]
-#
-# Interpretation:
-#   • 1 core at 100%, rest idle  → Python GIL bottleneck / single-threaded overhead
-#   • All cores at 100%          → Data preprocessing / CPU compute bottleneck
-#   • All cores idle             → Synchronisation or GPU-side bottleneck
-#
-# Requires: mpstat (sysstat package) or top
-#   Install: sudo apt install sysstat   |   brew install sysstat
-
 OUTPUT_DIR="${1:-./profiling_results}"
-INTERVAL="${2:-2}"      # seconds between samples
-DURATION="${3:-120}"    # total monitoring duration in seconds
+INTERVAL="${2:-2}"     
+DURATION="${3:-120}"   
 
 mkdir -p "$OUTPUT_DIR"
 OUTFILE="$OUTPUT_DIR/cpu_util_$(date +%Y%m%d_%H%M%S).log"
@@ -61,7 +44,6 @@ fi
 echo ""
 echo "CPU monitoring complete. Results → $OUTFILE"
 
-# ── simple summary via awk (mpstat output) ────────────────────────────────
 if command -v mpstat &>/dev/null && command -v awk &>/dev/null; then
     echo ""
     echo "─── Per-core average utilisation ───" | tee -a "$OUTFILE"

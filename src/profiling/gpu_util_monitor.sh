@@ -1,18 +1,3 @@
-#!/usr/bin/env bash
-# gpu_util_monitor.sh
-# ───────────────────
-# Experiment 2: GPU utilisation timeline.
-#
-# Usage:
-#   chmod +x profiling/gpu_util_monitor.sh
-#   ./profiling/gpu_util_monitor.sh [output_dir] [duration_seconds]
-#
-# Runs two nvidia-smi monitors in parallel:
-#   (a) dmon  - 1-second-resolution SM/MEM/power time series
-#   (b) watch-style loop - human-readable snapshots every 2 seconds
-#
-# Requires: nvidia-smi (comes with NVIDIA driver)
-
 OUTPUT_DIR="${1:-./profiling_results}"
 DURATION="${2:-120}"
 
@@ -30,13 +15,11 @@ if ! command -v nvidia-smi &>/dev/null; then
     exit 1
 fi
 
-# ── (a) dmon: SM util, memory util, power ────────────────────────────────
 echo "Starting nvidia-smi dmon (SM + MEM + power, 1s interval)..."
 timeout "$DURATION" nvidia-smi dmon -s pum -d 1 2>&1 \
     | tee "$DMON_FILE" &
 DMON_PID=$!
 
-# ── (b) periodic snapshots every 2 s ─────────────────────────────────────
 echo "Starting periodic GPU snapshots (every 2s)..."
 {
     ITER=0
