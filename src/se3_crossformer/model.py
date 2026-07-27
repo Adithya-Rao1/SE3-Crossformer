@@ -639,16 +639,16 @@ class SE3InterNeighborhoodLayer(nn.Module):
 
                 for J_str, phi_net in phi_nets.items():
                     J = int(J_str)
-                    
-                    phi_S  = phi_net(m_k)                           
-                    phi_NS = phi_S.unsqueeze(0).expand(N, S, 1).reshape(N*S, 1)                     
-                
-                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS) 
+
+                    phi_S  = phi_net(m_k)                                 
+                    phi_NS = phi_S.unsqueeze(0).expand(N, S).reshape(N * S, 1)
+
+                    W_NS = _equivariant_weight_single_J(x_rel, l, k, J, phi_NS)
                     W    = W_NS.view(N, S, 2 * l + 1, 2 * k + 1)
-                
-                    Wf = torch.einsum("nsij,scj->nsci", W, m_k)   
-                
-                    gamma_exp     = gamma.unsqueeze(-1).unsqueeze(-1)   
+
+                    Wf = torch.einsum("nsij,scj->nsci", W, m_k)
+
+                    gamma_exp     = gamma.unsqueeze(-1).unsqueeze(-1)
                     cross_contrib = cross_contrib + (gamma_exp * Wf).sum(dim=1)
                     f_updated[l] = f_out[l] + cross_contrib
 
