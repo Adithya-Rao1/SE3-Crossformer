@@ -20,6 +20,11 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
+
+from torch_geometric.datasets import QM9
+from torch_geometric.loader import DataLoader
+from torch_geometric.transforms import Compose, Distance, NormalizeFeatures
+
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -32,29 +37,24 @@ ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
 }
 
+# alpha, gap, homo, lumo, mu, and Cv
+target_indices = [1, 4, 3, 2, 0, 11]
+
 def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
     return torch.tensor(
         [ATOMIC_MASSES.get(zi.item(), 12.0) for zi in z],
         dtype=torch.float32,
     )
 
-def load_qm9(batch_size=16, r: str = "./data", device=torch.device("cpu")):
-    try:
-        from torch_geometric.datasets import QM9
-        from torch_geometric.loader import DataLoader
-        from torch_geometric.transforms import Compose, Distance, NormalizeFeatures
-    except ImportError:
-        raise ImportError(
-            "torch_geometric is required. Install with:\n"
-            "  pip install torch_geometric"
-        )
-
+def load_qm9(target_index=1, batch_size=16, r: str = "./data", device=torch.device("cpu")):
     dataset = CustomQM9Dataset(
         root=r+"/qm1",
         sdf_file=r+"/qm9/raw/gdb9.sdf",
         csv_file=r+"/qm9/raw/gdb9.sdf.csv",
         device=device,
     )
+
+    dataset.y = dataset.y[:, target_index]
 
     idx1 = 110000
     idx2 = 120000
@@ -193,7 +193,7 @@ def evaluate(model, loader, num_parts, device, epoch=None):
             continue
 
         pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
-        mae  = nn.functional.l1_loss(pred.squeeze(-1), target).item()
+        mae  = nn.functional.l1_loss(pred, target).item()
         B    = pred.shape[0]
         total_mae += mae * B
         n_graphs  += B
@@ -220,6 +220,7 @@ def confidence_interval_95(values):
 def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
     parser = argparse.ArgumentParser()
     parser.add_argument("--target",      type=int,   default=1)
+    parser.add_argument("--target_indices", type=list, default=target_indices, help="Target indices for multiple runs")
     parser.add_argument("--num_parts",   type=int,   default=4)
     parser.add_argument("--max_degree",  type=int,   default=2)
     parser.add_argument("--batch_size",  type=int,   default=32)
@@ -263,7 +264,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
 
         checkpoint_path = os.path.join(
             args.metrics_dir,
-            f"best_model_trial{trial}.pt"
+            f"best_model_trial{trial}_target{args.target}.pt"
         )
 
         if args.rbf_type == "grbf":
@@ -282,7 +283,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                 feature_dim=args.feature_dim,
                 hidden_dim=args.hidden_dim,
                 num_parts=args.num_parts,
-                scalar_out_dim=19,
+                scalar_out_dim=1,
                 task=0,
                 partition_type=args.partition_type
             ).to(device)
@@ -295,7 +296,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                 feature_dim=args.feature_dim,
                 hidden_dim=args.hidden_dim,
                 num_parts=args.num_parts,
-                scalar_out_dim=19,
+                scalar_out_dim=1,
                 task=0,
                 partition_type=args.partition_type
             ).to(device)
