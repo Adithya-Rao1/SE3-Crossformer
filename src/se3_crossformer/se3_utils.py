@@ -405,10 +405,9 @@ class IrrepLinear(nn.Module):
         self.weight = nn.Linear(channels, channels, bias=False)
 
     def forward(self, x):
-        # x: [N,C,m]
-        x = x.transpose(1,2)
+        x = x.transpose(-1,-2)
         x = self.weight(x)
-        return x.transpose(1,2)
+        return x.transpose(-1,-2)
 
 class EquivariantReadout(nn.Module):
     def __init__(self, C: int, hidden: int = 64):

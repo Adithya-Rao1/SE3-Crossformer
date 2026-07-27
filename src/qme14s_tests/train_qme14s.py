@@ -120,7 +120,7 @@ class PolarizabilityHead(nn.Module):
         B = f0.shape[0]
 
         f0m = self.irrep_lin0(f0).squeeze(-1)
-        alpha_iso = self.iso_linear(iso_in)
+        alpha_iso = self.iso_linear(f0m)
         iso_tensor = alpha_iso.view(B, 1, 1) * self.identity3.unsqueeze(0)
 
         f2m = self.irrep_lin2(f2)
@@ -144,7 +144,7 @@ class DeDipoleHead(nn.Module):
         self.register_buffer("identity3", torch.eye(3))
 
         self.irrep_lin11 = IrrepLinear(feature_dim)
-        self.skew_red = nn.Linear(feature_dim, 1)
+        self.skew_red = EquivariantReadout(feature_dim)
 
         self.irrep_lin2 = IrrepLinear(feature_dim)
         self.aniso_readout = EquivariantReadout(feature_dim, hidden_dim)
@@ -171,8 +171,8 @@ class DeDipoleHead(nn.Module):
         iso_tensor = alpha_iso.view(N, 1, 1) * self.identity3.unsqueeze(0)
 
         f1_skew_emb = self.irrep_lin11(f1)
-        f1_skew_red = self.skew_red(f1_skew_emb.transpose(-1, -2)).transpose(-1, -2)
-        v1_skew = torch.einsum("ij,bcj->bci", self.sh1_to_cartesian, f1_skew_red)
+        f1_skew_red = self.skew_red(f1_skew_emb).squeeze(1)
+        v1_skew = torch.einsum("ij,bj->bi", self.sh1_to_cartesian, f1_skew_red)
         skew_tensor = self.f1_to_skew(v1_skew)
 
         f2m = self.irrep_lin2(f2)
