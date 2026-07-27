@@ -1,23 +1,3 @@
-"""
-forward_breakdown.py
---------------------
-Experiment 9: Time each major block of the forward pass and report
-the percentage of total forward time each block comprises.
-
-Blocks timed:
-  • input_embedding
-  • graph_build   (spectral partition + neighbor info)
-  • layer_{i}     (each SE3InterNeighborhoodLayer)
-    ├─ intra_update
-    ├─ initial_message
-    ├─ message_update
-    └─ cross_update
-  • readout
-
-Uses a monkey-patched version of the model's layer forward to insert timers
-without modifying the source code.
-"""
-
 import time
 import logging
 from typing import Dict, Any, List
@@ -64,9 +44,6 @@ def run_forward_breakdown_experiment(
     device: torch.device,
     num_batches: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Returns dict with block timing lists, means, and percentage breakdown.
-    """
     log.info(f"  Forward breakdown experiment: {num_batches} batches")
 
     import sys
@@ -93,7 +70,6 @@ def run_forward_breakdown_experiment(
 
     timing_store: Dict[str, List[float]] = {}
 
-    # ── patch each layer to time its sub-blocks ───────────────────────────
     original_layer_forwards = {}
 
     def make_patched_forward(layer_idx, orig_forward):
@@ -139,8 +115,6 @@ def run_forward_breakdown_experiment(
 
         with _timer(timing_store, "graph_build"):
             B = int(graph_batch.max().item()) + 1
-            # just trigger the build portion via a dummy forward to get graph_build time
-            # We actually time it inside the full forward below
             pass
 
         _cuda_sync()
@@ -153,7 +127,6 @@ def run_forward_breakdown_experiment(
             f1 = torch.randn(N, f0.shape[1], 3,  device=device) * (1/math.sqrt(3.0))
             f2 = torch.randn(N, f0.shape[1], 5,  device=device) * (1/math.sqrt(5.0))
 
-        # Time graph build separately
         with _timer(timing_store, "graph_build"):
             with torch.no_grad():
                 _ = model(node_feat, pos, edge_index, am, graph_batch)
@@ -167,12 +140,10 @@ def run_forward_breakdown_experiment(
             f"total_fwd={timing_store['total_forward'][-1]*1e3:.1f}ms"
         )
 
-    # Restore original layer forwards
     for i, layer in enumerate(model.layers):
         if i in original_layer_forwards:
             layer.forward = original_layer_forwards[i]
 
-    # ── compute means and percentages ─────────────────────────────────────
     def _mean(lst):
         return sum(lst) / len(lst) if lst else 0.0
 
@@ -185,7 +156,6 @@ def run_forward_breakdown_experiment(
             continue
         block_pct[k] = 100.0 * v / max(total_mean, 1e-9)
 
-    # Sort by percentage descending
     block_pct = dict(sorted(block_pct.items(), key=lambda x: x[1], reverse=True))
 
     log.info("  Block breakdown (% of total forward):")

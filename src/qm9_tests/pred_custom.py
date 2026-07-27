@@ -1,25 +1,3 @@
-"""
-predict_custom_model.py
-------------------------
-Load trained SE3InterNeighborhoodTransformer checkpoints (one per trial, as
-saved by train.py: `best_model_trial{trial}.pt`) and evaluate them on the
-QM9 test set.
-
-For each trial:
-  - loads the checkpoint
-  - runs a full evaluation pass over the held-out test set
-  - writes per-molecule predictions/targets/absolute-error to a CSV
-  - records the trial-level MAE ("accuracy" metric for regression)
-
-Across the trials:
-  - computes the mean MAE and its 95% confidence interval (t-distribution),
-    matching the CI method already used in train.py::confidence_interval_95
-
-Usage:
-    python predict_custom_model.py --target 0 --num_parts 8 --max_degree 2 \
-        --checkpoint_dir . --trials 5 --data_root ./data
-"""
-
 import argparse
 import csv
 import json
@@ -48,8 +26,6 @@ def confidence_interval_95(values):
 
 @torch.no_grad()
 def predict_and_record(model, loader, num_parts, device, out_csv):
-    """Run inference over `loader`, write per-molecule rows to `out_csv`,
-    and return the overall MAE for this pass."""
     model.eval()
     rows = []
     total_abs_err = 0.0

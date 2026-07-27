@@ -1,20 +1,3 @@
-"""
-torch_profiler_exp.py
----------------------
-Experiments 3 & 10: PyTorch profiler + kernel launch analysis.
-
-Runs torch.profiler.profile on a small subset of training data and extracts:
-  • Top-K slowest ops (by total CPU + CUDA time)
-  • Scatter/gather ops
-  • Attention kernel times
-  • Python call overhead
-  • Kernel launch count vs. useful-work time
-  • GPU busy time vs idle time
-
-The Chrome trace is saved to profiling_results/ for external inspection in
-chrome://tracing.
-"""
-
 import time
 import logging
 from typing import Dict, Any, List
@@ -44,11 +27,8 @@ def run_torch_profiler_experiment(
     args,
     device: torch.device,
     num_batches: int = 3,
-    kernel_mode: bool = False,   # if True, focus on kernel launch analysis
+    kernel_mode: bool = False,   
 ) -> Dict[str, Any]:
-    """
-    Returns dict with profiler summary data.
-    """
     mode_label = "kernel_launch" if kernel_mode else "torch_profiler"
     log.info(f"  PyTorch profiler [{mode_label}]: {num_batches} batches on {device}")
 
@@ -129,14 +109,12 @@ def run_torch_profiler_experiment(
             _step(batch)
             prof.step()
 
-    # Also export Chrome trace
     try:
         prof.export_chrome_trace(trace_path)
         log.info(f"  Chrome trace saved → {trace_path}")
     except Exception as e:
         log.warning(f"  Chrome trace export failed: {e}")
 
-    # ── extract key metrics ───────────────────────────────────────────────
     TOP_K = 20
 
     try:
@@ -159,7 +137,6 @@ def run_torch_profiler_experiment(
                 "flops":          getattr(entry, "flops", 0),
             })
 
-        # Scatter / gather ops
         scatter_gather_ops = [
             e for e in key_averages
             if any(kw in e.key.lower() for kw in ["scatter", "gather", "index"])
@@ -169,7 +146,6 @@ def run_torch_profiler_experiment(
             for e in scatter_gather_ops
         )
 
-        # Attention-related kernels
         attn_ops = [
             e for e in key_averages
             if any(kw in e.key.lower() for kw in ["softmax", "bmm", "einsum", "matmul"])
@@ -179,27 +155,23 @@ def run_torch_profiler_experiment(
             for e in attn_ops
         )
 
-        # Python/prim overhead
         python_ops = [
             e for e in key_averages
             if "python" in e.key.lower() or "call_function" in e.key.lower()
         ]
         python_time_us = sum(e.self_cpu_time_total for e in python_ops)
 
-        # Kernel launch vs useful work (CUDA only)
         kernel_launch_count = 0
         total_cuda_us = 0
         if use_cuda:
             for e in key_averages:
                 kernel_launch_count += e.count
                 total_cuda_us       += e.self_cuda_time_total
-            # Estimate GPU busy time from CUDA activities
             total_cpu_us_with_cuda = sum(e.self_cpu_time_total for e in key_averages)
             gpu_busy_pct = (total_cuda_us / max(total_cpu_us_with_cuda, 1)) * 100
         else:
             gpu_busy_pct = 0.0
 
-        # Total FLOPS
         total_flops = sum(getattr(e, "flops", 0) or 0 for e in key_averages)
 
         result = {

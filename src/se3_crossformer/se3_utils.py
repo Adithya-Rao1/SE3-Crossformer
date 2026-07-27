@@ -1,19 +1,3 @@
-"""
-se3_utils.py  (optimized)
---------------------------
-Key changes vs. original
-  ① RadialNetwork
-      • _basis() removed entirely.  The original called scipy.special.jv and
-        spherical_bessel_first_kind on the CPU inside every forward pass,
-        causing a CPU↔GPU round-trip per (l, k, J) per batch.
-      • Replaced with a GPU-native RBF basis: Gaussian-envelope Bessel-style
-        radial features built entirely in PyTorch with no NumPy/scipy in the
-        hot path.  Roots are precomputed once at construction time and stored
-        as a non-trainable buffer on the correct device.
-      • forward() now accepts only (r,) — degree and k are no longer needed,
-        simplifying all call sites.
-"""
-
 from math import pi, sqrt
 from functools import reduce, lru_cache
 from operator import mul
@@ -24,36 +8,16 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-# Public re-export so existing importers don't break
-from src.se3_crossformer.spherical_harm import (
-    get_spherical_harmonics,
-    get_spherical_harmonics_element,
-    clear_spherical_harmonics_cache,
-    lpmv,
-    semifactorial,
-    pochhammer,
-    CACHE,
-)
-
+from src.se3_crossformer.spherical_harm import *
+from src.se3_crossformer.irr_rep import x_to_alpha_beta
 from src.se3_crossformer.bessel_gpu import BesselTable
 
 from e3nn import o3
+
 _CG_CACHE: Dict[Tuple[int, int], Dict[int, torch.Tensor]] = {}
 _SH_BASIS_CHANGE_CACHE: Dict[int, torch.Tensor] = {}
 
-
 def _fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
-    """
-    Fits the orthogonal change-of-basis matrix U_l relating e3nn's real
-    spherical harmonics to THIS codebase's get_spherical_harmonics, for the
-    same physical direction n:
-
-        get_spherical_harmonics(l, theta, phi)  ≈  e3nn_Y_l(n) @ U_l
-
-    Used ONLY inside clebsch_gordan_matrix, to translate e3nn's Wigner 3j
-    coefficients into get_spherical_harmonics' own convention. Nothing else
-    in the model calls e3nn or bypasses get_spherical_harmonics.
-    """
     if l in _SH_BASIS_CHANGE_CACHE:
         return _SH_BASIS_CHANGE_CACHE[l]
 
@@ -63,35 +27,22 @@ def _fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-4) -> t
     n = n / n.norm(dim=-1, keepdim=True)
 
     alpha, beta = x_to_alpha_beta(n)
-    theta = math.pi - beta   # matches every existing call site exactly
+    theta = math.pi - beta   
 
-    Y_custom = get_spherical_harmonics(l, theta=theta, phi=alpha).to(torch.float64)                     # [N, 2l+1]
-    Y_e3nn   = o3.spherical_harmonics(l, n, normalize=True, normalization='component').to(torch.float64)  # [N, 2l+1]
+    Y_custom = get_spherical_harmonics(l, theta=theta, phi=alpha).to(torch.float64)                    
+    Y_e3nn   = o3.spherical_harmonics(l, n, normalize=True, normalization='component').to(torch.float64)  
 
-    U, *_ = torch.linalg.lstsq(Y_e3nn, Y_custom)   # Y_e3nn @ U ≈ Y_custom
+    U, *_ = torch.linalg.lstsq(Y_e3nn, Y_custom) 
     resid = (Y_e3nn @ U - Y_custom).abs().max().item()
     assert resid < tol, f"SH basis-change fit residual too high for l={l}: {resid:.2e}"
 
-    # Re-orthogonalize defensively (U should already be ~orthogonal since both
-    # bases are orthonormal) to avoid compounding lstsq drift into the CG conjugation.
     Uo, _, Vt = torch.linalg.svd(U)
     U = (Uo @ Vt).to(torch.float32)
 
     _SH_BASIS_CHANGE_CACHE[l] = U
     return U
 
-
 def clebsch_gordan_matrix(l: int, k: int) -> Dict[int, torch.Tensor]:
-    """
-    Return {J: Q_J} matrices, Q_J: [(2l+1)(2k+1), 2J+1], cached after first call.
-
-    Computed via e3nn.o3.wigner_3j (correct for real, component-normalized
-    harmonics) then conjugated through the fitted basis-change matrices
-    U_l, U_k, U_J so the result correctly intertwines get_spherical_harmonics'
-    own convention. The previous sympy-based CG() implementation assumed the
-    complex Y_l^m convention, which does not match get_spherical_harmonics
-    and silently broke equivariance for any l,k >= 1.
-    """
     if (l, k) in _CG_CACHE:
         return _CG_CACHE[(l, k)]
 
@@ -102,27 +53,15 @@ def clebsch_gordan_matrix(l: int, k: int) -> Dict[int, torch.Tensor]:
     for J in range(abs(l - k), l + k + 1):
         U_J = _fit_sh_basis_change(J).to(torch.float64)
 
-        w3j     = o3.wigner_3j(l, k, J).to(torch.float64)                  # [2l+1, 2k+1, 2J+1]
-        Q_e3nn  = w3j.reshape((2 * l + 1) * (2 * k + 1), 2 * J + 1)        # [(2l+1)(2k+1), 2J+1]
-
-        K = torch.kron(U_l, U_k)                                          # [(2l+1)(2k+1), (2l+1)(2k+1)]
+        w3j     = o3.wigner_3j(l, k, J).to(torch.float64)                  
+        Q_e3nn  = w3j.reshape((2 * l + 1) * (2 * k + 1), 2 * J + 1)        
+        K = torch.kron(U_l, U_k)                                          
         Q_custom_J = K.T @ Q_e3nn @ U_J
 
         result[J] = Q_custom_J.to(torch.float32)
 
     _CG_CACHE[(l, k)] = result
     return result
-
-def precompute_cg_matrices(max_degree: int) -> None:
-    for l in range(max_degree + 1):
-        for k in range(max_degree + 1):
-            clebsch_gordan_matrix(l, k)
-    print(f"Precomputed CG matrices for degrees 0..{max_degree}.")
-
-
-# ---------------------------------------------------------------------------
-# 1. RadialNetwork — GPU-native, no scipy in forward pass
-# ---------------------------------------------------------------------------
 
 def find_kth_sph_root(order, k, thresh=1e-8):
     """
@@ -131,51 +70,26 @@ def find_kth_sph_root(order, k, thresh=1e-8):
     c = 0
     assert abs(order) in [0, 1, 2, 3], "Order out of bounds of function"
 
-    # print("order: ", order)
-    # print("k: ", k)
-
     if order == 0:
         c = (k+1) * math.pi
     elif  order in range(-3, 4):
-        """
-        Using absolute order since J_(-n)(x) = (-1)^n * J_n(x)
-        So,
-        J_(-n)(x) and J_n(x) have same roots
-        """
         n = abs(order) + 1/2
 
         # Works for k \in {1, 2, 3}
         # beta = (k+1) * n + 1.85575 * math.pow(n, (1/3)) + 1.033
 
         guess = ((k+1) + abs(order)/2 - 1/4) * math.pi
-
-        # print("Guess 1: ", beta)
-        # print("Guess 2: ", guess)
-        
         interval_begin = guess - math.pi/2
         interval_end = guess + math.pi/2
 
         while abs(guess) > thresh:
             c = (interval_begin + interval_end)/2
             guess = jv(n, c)
-
-            """
-            If c < 0 and begin < 0, zero between c and end (+)
-
-            If c > 0 and begin < 0, zero between begin and c (-)
-
-            If c < 0 and begin > 0, zero between begin and c (-)
-
-            If c > 0 and begin > 0, zero between c and end (+)
-            """
-            if jv(n, interval_begin) * guess < 0: # root in [init_begin, c]
+            if jv(n, interval_begin) * guess < 0:
                 interval_end = c
             else:
-                interval_begin = c # root in [c, init_end]
+                interval_begin = c
 
-            # print("guess: ", guess)
-
-        # print("Found root!")
     return c
 
 def spherical_bessel_first_kind(
@@ -210,14 +124,14 @@ class RadialNetworkSFB(nn.Module):
     def _basis(self, r: torch.Tensor, degree: int, k:int, cutoff_radius=3.0) -> torch.Tensor:
         bases = []
 
-        for ord in range(-degree, degree + 1): # order m ranges from -l to l (l is degree)
+        for ord in range(-degree, degree + 1):
             kth_root  = find_kth_sph_root(ord, k)                 
             argument  = (kth_root / cutoff_radius) * r         
 
             sph_bes_denom = spherical_bessel_first_kind(ord + 1, kth_root, device='cpu')
             sph_bes_r     = spherical_bessel_first_kind(ord,     argument,  device='cpu')
 
-            sph_bes_r = sph_bes_r.reshape(-1)  # [N_atoms]
+            sph_bes_r = sph_bes_r.reshape(-1)  
 
             norm_factor = (
                 2.0 / ((cutoff_radius ** 3) * (sph_bes_denom ** 2) * kth_root + 1e-12)
@@ -229,30 +143,16 @@ class RadialNetworkSFB(nn.Module):
         return torch.stack(bases, dim=0).reshape(-1, 1)
  
     def forward(self, r: torch.Tensor, order: int, k: int) -> torch.Tensor:
-        """r: [...], returns scalar [...] """
         bases = self._basis(r, order, k)
         out = self.net(bases.to(r.device).reshape(-1, 2*order+1))
         return out
 
 class RadialNetworkGSFB(nn.Module):
-    """
-    Args:
-        num_basis:     accepted for drop-in compatibility with existing call
-                        sites (`RadialNetwork(num_basis=(2*l+1), ...)`), but
-                        NOT used -- the Bessel-basis width is fixed by
-                        `orders`, not by this argument.
-        hidden_dim:    width of the 2-layer MLP mapping basis -> scalar.
-        cutoff_radius: envelope cutoff (Å or Bohr, must match positions).
-        orders:        which spherical Bessel orders l to use as features.
-        N_cheb:        Chebyshev nodes per segment (passed to BesselTable).
-        seg_width:     width of each piecewise segment (passed to BesselTable).
-    """
- 
     _table_cache: Dict[Tuple[Tuple[int, ...], float, int, float], "BesselTable"] = {}
  
     def __init__(
         self,
-        num_basis:     int = 8,          # unused; kept for interface parity
+        num_basis:     None = None,        
         hidden_dim:    int = 32,
         cutoff_radius: float = 5.0,
         orders:        Tuple[int, ...] = (0, 1, 2, 3),
@@ -266,8 +166,6 @@ class RadialNetworkGSFB(nn.Module):
  
         table = self._get_or_build_table(self.orders, self.cutoff_radius, N_cheb, seg_width)
  
-        # Register as buffers (not parameters) so they move with .to()/.cuda()
-        # but are never trained -- only `self.net` below has learnable weights.
         self.register_buffer("_coeffs", table.coeffs.clone())
         self.n_seg             = table.n_seg
         self.seg_width_actual  = table.seg_width_actual
@@ -298,46 +196,21 @@ class RadialNetworkGSFB(nn.Module):
         return seg_idx.long(), t_local
  
     def _basis(self, r: torch.Tensor) -> torch.Tensor:
-        """
-        r: Tensor[N, 1] distances (or any shape; flattened internally)
-        returns: Tensor[N, num_orders] == [j_l0(r), j_l1(r), ...] stacked
-        """
         r_flat = r.reshape(-1).to(self._coeffs.dtype)
         seg_idx, t_local = self._map_to_segments(r_flat)
  
-        c        = self._coeffs[:, seg_idx, :]                         # [num_orders, N, N_cheb]
-        theta    = torch.arccos(t_local.clamp(-1.0, 1.0))               # [N]
+        c        = self._coeffs[:, seg_idx, :]                        
+        theta    = torch.arccos(t_local.clamp(-1.0, 1.0))               
         k_idx    = torch.arange(self.N_cheb, device=r.device, dtype=self._coeffs.dtype)
-        T_basis  = torch.cos(theta.unsqueeze(-1) * k_idx.unsqueeze(0))  # [N, N_cheb]
-        jl       = (c * T_basis.unsqueeze(0)).sum(dim=-1)               # [num_orders, N]
-        return jl.t().to(r.dtype)                                       # [N, num_orders]
+        T_basis  = torch.cos(theta.unsqueeze(-1) * k_idx.unsqueeze(0)) 
+        jl       = (c * T_basis.unsqueeze(0)).sum(dim=-1)               
+        return jl.t().to(r.dtype)                                       
  
     def forward(self, r: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        """
-        Args:
-            r: Tensor[N, 1] -- distances on the correct device
-            *args, **kwargs: ignored (degree / k legacy args accepted but unused,
-                              matching RadialNetworkGRFB's forward contract)
-        Returns:
-            Tensor[N, 1]
-        """
-        basis = self._basis(r)          # [N, num_orders]
-        return self.net(basis)          # [N, 1]
+        basis = self._basis(r)         
+        return self.net(basis)        
 
 class RadialNetworkGRBF(nn.Module):
-    """
-    Learnable radial function r → scalar.
-
-    Basis: num_basis Gaussian-RBF features centred on a uniform grid of
-    Bessel-root-inspired breakpoints in [0, cutoff_radius].  All computed
-    on the GPU; no scipy, no NumPy, no CPU↔GPU transfers in forward().
-
-    Args:
-        num_basis:      number of radial basis functions
-        hidden_dim:     width of the 2-layer MLP
-        cutoff_radius:  envelope cutoff (Å or Bohr, must match positions)
-    """
-
     def __init__(
         self,
         num_basis:     int   = 8,
@@ -348,19 +221,15 @@ class RadialNetworkGRBF(nn.Module):
         self.num_basis     = num_basis
         self.cutoff_radius = cutoff_radius
 
-        # Centres evenly spaced in [0, cutoff_radius]; stored as a buffer
-        # so they move to the right device with .to(device) / .cuda().
-        centres = torch.linspace(0.0, cutoff_radius, num_basis)   # [B]
+        centres = torch.linspace(0.0, cutoff_radius, num_basis)   
         self.register_buffer("centres", centres)
 
-        # Width: half the spacing between centres
         width = cutoff_radius / max(num_basis - 1, 1)
         self.register_buffer(
             "inv_width_sq",
             torch.tensor(-1.0 / (2.0 * width ** 2)),
         )
 
-        # Cosine-envelope cutoff to enforce smoothness at cutoff_radius
         # f(r) = 0.5*(cos(pi*r/cutoff)+1) for r < cutoff, else 0
         self.net = nn.Sequential(
             nn.Linear(num_basis, hidden_dim, bias=False),
@@ -373,45 +242,25 @@ class RadialNetworkGRBF(nn.Module):
     def _basis(self, r: torch.Tensor) -> torch.Tensor:
         """
         Gaussian RBF basis.
-
-        Args:
-            r: Tensor[N, 1]  — interatomic distances (must be on same device
-               as self.centres)
-        Returns:
-            Tensor[N, num_basis]
         """
-        # [N, 1] - [1, B] → [N, B]
-        diff    = r - self.centres.unsqueeze(0)          # [N, B]
-        rbf     = torch.exp(self.inv_width_sq * diff * diff)  # [N, B]
+        diff    = r - self.centres.unsqueeze(0)          
+        rbf     = torch.exp(self.inv_width_sq * diff * diff) 
 
-        # Cosine envelope: zero outside cutoff, smooth at boundary
-        r_scaled = (r / self.cutoff_radius).clamp(max=1.0)         # [N, 1]
-        envelope = 0.5 * (torch.cos(math.pi * r_scaled) + 1.0)    # [N, 1]
+        r_scaled = (r / self.cutoff_radius).clamp(max=1.0)         
+        envelope = 0.5 * (torch.cos(math.pi * r_scaled) + 1.0)    
 
-        return rbf * envelope   # [N, B]
+        return rbf * envelope   
 
     def forward(self, r: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        """
-        Args:
-            r:    Tensor[N, 1] — distances on the correct device
-            *args, **kwargs: ignored (degree / k legacy args accepted but unused)
-        Returns:
-            Tensor[N, 1]
-        """
-        basis = self._basis(r)          # [N, num_basis]
-        return self.net(basis)          # [N, 1]
-
-
-# ---------------------------------------------------------------------------
-# 2. equivariant_weight_matrix — vectorised, no recursion in hot path
-# ---------------------------------------------------------------------------
+        basis = self._basis(r)          
+        return self.net(basis)        
 
 def equivariant_weight_matrix(
-    x:          torch.Tensor,   # [N, 3]
+    x:          torch.Tensor,   
     l:          int,
     k:          int,
     radial_net: nn.Module,
-) -> torch.Tensor:               # [N, 2l+1, 2k+1]
+) -> torch.Tensor:               
     """
     Equivariant weight matrix W^{lk}(x) summed over all valid J channels.
     """
@@ -424,16 +273,15 @@ def equivariant_weight_matrix(
     if N == 0:
         return W
 
-    r      = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)   # [N, 1]
-    alphas, betas = x_to_alpha_beta(x)                       # [N], [N]
+    r      = x.norm(dim=-1, keepdim=True).clamp(min=1e-8) 
+    alphas, betas = x_to_alpha_beta(x)                     
 
-    cg = clebsch_gordan_matrix(l, k)   # fetched from cache
+    cg = clebsch_gordan_matrix(l, k)   
 
     for J in range(abs(l - k), l + k + 1):
         if J not in cg:
             continue
 
-        # Select the radial sub-network for this J
         if isinstance(radial_net, nn.ModuleDict):
             if str(J) not in radial_net:
                 continue
@@ -441,17 +289,16 @@ def equivariant_weight_matrix(
         else:
             rnet = radial_net
 
-        phi = rnet(r)                                         # [N, 1]
+        phi = rnet(r)                                       
 
-        Q_J = cg[J].to(device=device, dtype=dtype)           # [(2l+1)(2k+1), 2J+1]
+        Q_J = cg[J].to(device=device, dtype=dtype)          
 
-        # Vectorised: one call for all N atoms simultaneously
         Y_J = get_spherical_harmonics(
             J, theta=(math.pi - betas), phi=alphas
-        )                                                     # [N, 2J+1]
+        )                                                     
 
-        QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)            # [N, (2l+1)(2k+1)]
-        had = phi * QTY                                       # [N, (2l+1)(2k+1)]
+        QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)           
+        had = phi * QTY                                      
         W   = W + had.view(N, 2 * l + 1, 2 * k + 1)
 
     return W
@@ -535,3 +382,88 @@ def verify_cg_orthogonality(max_degree: int = 2, tol: float = 1e-5) -> None:
         raise ValueError(
             "One or more CG matrices failed the orthogonality check."
         )
+
+def _cartesian_dipole(n: torch.Tensor) -> torch.Tensor:
+    return n
+
+def fit_sh_to_cartesian(l: int, target_fn, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
+    n = torch.randn(n_samples, 3, dtype=torch.float64)
+    n = n / n.norm(dim=-1, keepdim=True)
+
+    alpha, beta = x_to_alpha_beta(n)
+    theta = math.pi - beta
+
+    Y_l = get_spherical_harmonics(l, theta=theta, phi=alpha)   
+    T   = target_fn(n)                                          
+
+    M, *_ = torch.linalg.lstsq(Y_l, T)
+    resid = (Y_l @ M - T).abs().max().item()
+    assert resid < tol, f"SH{l}->Cartesian fit residual too high: {resid:.2e}"
+
+    return M.T.float()
+
+class IrrepLinear(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.weight = nn.Linear(channels, channels, bias=False)
+
+    def forward(self, x):
+        # x: [N,C,m]
+        x = x.transpose(1,2)
+        x = self.weight(x)
+        return x.transpose(1,2)
+
+class EquivariantReadout(nn.Module):
+    def __init__(self, C: int, hidden: int = 64):
+        super().__init__()
+        self.proj = nn.Linear(C, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(-1, -2)     
+        x = self.proj(x)             
+        return x.squeeze(-1)        
+
+class EquivariantNormReadout(nn.Module):
+    def __init__(self, C: int, hidden: int = 64, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.equiv_proj = nn.Linear(C, hidden, bias=False)   
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        v = self.equiv_proj(x.transpose(-1, -2))              
+        v = v.transpose(-1, -2)                               
+        norms = torch.sqrt((v ** 2).sum(dim=-1) + self.eps)  
+        return self.mlp(norms).squeeze(-1)                    
+
+def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
+    """Return the CG matrix for a single J from the cached dict."""
+    from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
+    return clebsch_gordan_matrix(l, k)[J]
+
+def _equivariant_weight_single_J(
+    x:   torch.Tensor,  
+    l:   int,
+    k:   int,
+    J:   int,
+    phi: torch.Tensor,  
+) -> torch.Tensor:     
+
+    device, dtype = x.device, x.dtype
+
+    if x.shape[0] == 0:
+        return torch.zeros(0, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype)
+
+    cg    = clebsch_gordan_matrix(l, k)
+    Q_J   = cg[J].to(device=device, dtype=dtype) 
+
+    alphas, betas = x_to_alpha_beta(x)            
+    Y_J = get_spherical_harmonics(J, theta=(math.pi - betas), phi=alphas) 
+
+    QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)
+    had = phi * QTY                               
+    return had.view(x.shape[0], 2 * l + 1, 2 * k + 1)

@@ -1,13 +1,3 @@
-"""
-num_workers_experiment.py
--------------------------
-Experiment 5: DataLoader num_workers sweep [0, 2, 4, 8, 16].
-
-Interpretation:
-  - Throughput increases with workers → CPU preprocessing is the bottleneck.
-  - Throughput plateaus early → not dataloader-limited; look elsewhere.
-"""
-
 import time
 import logging
 from typing import Dict, Any, List
@@ -23,13 +13,6 @@ def run_num_workers_experiment(
     args,
     num_batches: int = 20,
 ) -> Dict[str, Any]:
-    """
-    Rebuilds the QM9 DataLoader with varying num_workers and measures
-    pure loading throughput (no model, no device transfer).
-
-    Returns dict with keys:
-        worker_counts, samples_per_sec, times_per_batch_s
-    """
     log.info("  num_workers sweep: " + str(WORKER_COUNTS))
 
     import sys

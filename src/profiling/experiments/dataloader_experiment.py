@@ -1,16 +1,3 @@
-"""
-dataloader_experiment.py
-------------------------
-Experiment 4: Dataloader throughput.
-
-Measures:
-  (a) Pure data loading time (CPU only, no device transfer)
-  (b) Data loading + host→device transfer time
-
-If (b) >> (a) the bottleneck is the H2D transfer (PCIe bandwidth).
-If (a) is already slow, the bottleneck is disk I/O or CPU preprocessing.
-"""
-
 import time
 import logging
 from typing import Dict, Any
@@ -33,7 +20,6 @@ def run_dataloader_experiment(
     """
     log.info(f"  Dataloader experiment: {num_batches} batches")
 
-    # ── pass 1: load-only ──────────────────────────────────────────────────
     load_only_times: list = []
     n_samples_load:  int  = 0
     loader_iter = iter(loader)
@@ -50,7 +36,6 @@ def run_dataloader_experiment(
         n_samples_load += int(batch.batch.max().item()) + 1
         log.debug(f"  load-only batch {i+1}: {(t1-t0)*1e3:.1f} ms")
 
-    # ── pass 2: load + H2D ────────────────────────────────────────────────
     load_h2d_times: list = []
     n_samples_h2d:  int  = 0
     loader_iter = iter(loader)
@@ -62,7 +47,6 @@ def run_dataloader_experiment(
         except StopIteration:
             loader_iter = iter(loader)
             batch = next(loader_iter)
-        # transfer everything in the batch
         _ = batch.to(device)
         if device.type == "cuda":
             torch.cuda.synchronize()

@@ -4,19 +4,13 @@ from typing import Dict, Any
 
 log = logging.getLogger("profiler.plots")
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")   # non-interactive backend
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
-    import numpy as np
-    HAS_MPL = True
-except ImportError:
-    HAS_MPL = False
-    log.warning("matplotlib not available; plots will be skipped.")
+import matplotlib
+matplotlib.use("Agg")  
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+HAS_MPL = True
 
-
-# ── colour palette ────────────────────────────────────────────────────────────
 COLOURS = {
     "load":     "#4e79a7",
     "h2d":      "#f28e2b",
@@ -25,7 +19,6 @@ COLOURS = {
     "optim":    "#59a14f",
     "default":  "#4e79a7",
 }
-
 
 def _savefig(fig, path: Path, name: str):
     out = path / name
@@ -47,7 +40,7 @@ def plot_all(experiments: Dict[str, Any], plot_dir: Path):
         "graph_construction": _plot_graph_construction,
         "forward_breakdown":  _plot_forward_breakdown,
         "torch_profiler":     _plot_torch_profiler,
-        "kernel_launch":      _plot_torch_profiler,   # reuse same plot
+        "kernel_launch":      _plot_torch_profiler,  
         "throughput":         _plot_throughput,
         "gpu_util":           _plot_gpu_util,
     }
@@ -65,8 +58,6 @@ def plot_all(experiments: Dict[str, Any], plot_dir: Path):
             log.error(f"  Plot for {name} failed: {e}", exc_info=True)
 
 
-# ── individual plot functions ─────────────────────────────────────────────────
-
 def _plot_timing(data: Dict, plot_dir: Path, name: str):
     """Experiment 1: stacked per-batch timing."""
     batches = list(range(1, len(data["load_times_s"]) + 1))
@@ -79,7 +70,6 @@ def _plot_timing(data: Dict, plot_dir: Path, name: str):
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
 
-    # ── top: stacked area ────────────────────────────────────────────────
     ax = axes[0]
     ax.stackplot(
         batches,
@@ -95,7 +85,6 @@ def _plot_timing(data: Dict, plot_dir: Path, name: str):
     ax.legend(loc="upper right", ncol=5, fontsize=8)
     ax.set_xlim(1, max(batches))
 
-    # ── bottom: means bar chart ───────────────────────────────────────────
     ax2 = axes[1]
     phases = ["load", "h2d", "forward", "backward", "optim"]
     means  = [
@@ -200,7 +189,6 @@ def _plot_graph_construction(data: Dict, plot_dir: Path, name: str):
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # stacked sub-steps
     ax = axes[0]
     ax.stackplot(
         x, spec, com, nbr,
@@ -212,7 +200,6 @@ def _plot_graph_construction(data: Dict, plot_dir: Path, name: str):
     ax.set_title("Graph construction sub-step times (stacked)")
     ax.legend(fontsize=8)
 
-    # build vs forward
     ax2 = axes[1]
     ax2.plot(x, tot, label="Total build", color=COLOURS["h2d"],     linewidth=2)
     ax2.plot(x, fwd, label="Forward",     color=COLOURS["forward"], linewidth=2, linestyle="--")
@@ -239,13 +226,11 @@ def _plot_forward_breakdown(data: Dict, plot_dir: Path, name: str):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    # pie
     explode = [0.05] * len(labels)
     ax1.pie(pcts, labels=labels, autopct="%1.1f%%", explode=explode,
             startangle=140, textprops={"fontsize": 7})
     ax1.set_title("Forward pass time distribution")
 
-    # horizontal bar
     y_pos = list(range(len(labels)))
     ax2.barh(y_pos, pcts, color=COLOURS["default"], edgecolor="white")
     ax2.set_yticks(y_pos)
@@ -282,7 +267,6 @@ def _plot_torch_profiler(data: Dict, plot_dir: Path, name: str):
     ax.set_title(f"PyTorch profiler: top-{len(names)} ops [{data.get('mode','')}]")
     ax.legend()
 
-    # Add GPU busy annotation
     gpu_busy = data.get("gpu_busy_pct", None)
     if gpu_busy is not None:
         ax.text(

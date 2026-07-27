@@ -1,13 +1,3 @@
-"""
-irr_rep.py  (patched)
----------------------
-Key changes vs. original
-  • x_to_alpha_beta: fully vectorised — no Python for-loop over atoms.
-    Returns (Tensor[N], Tensor[N]) instead of (list, list).
-  • All callers in se3_utils.equivariant_weight_matrix are updated to
-    consume the tensor pair directly.
-"""
-
 import os
 import numpy as np
 import torch
@@ -29,7 +19,6 @@ except Exception:
     Jd_np = np.load(str(path), allow_pickle=True)
     Jd = list(map(torch.from_numpy, Jd_np))
 
-
 def wigner_d_matrix(degree, alpha, beta, gamma, dtype=None, device=None):
     """Create wigner D matrices for batch of ZYZ Euler angles for degree l."""
     J = Jd[degree].type(dtype).to(device)
@@ -39,7 +28,6 @@ def wigner_d_matrix(degree, alpha, beta, gamma, dtype=None, device=None):
     res = x_a @ J @ x_b @ J @ x_c
     order = to_order(degree)
     return res.view(order, order)
-
 
 def z_rot_mat(angle, l):
     device, dtype = angle.device, angle.dtype
@@ -52,14 +40,12 @@ def z_rot_mat(angle, l):
     m[inds, inds]          = cos(frequencies * angle[None])
     return m
 
-
 def irr_repr(order, alpha, beta, gamma, dtype=None):
     """Irreducible representation of SO3."""
     cast_ = cast_torch_tensor(lambda t: t)
     dtype = default(dtype, torch.get_default_dtype())
     alpha, beta, gamma = map(cast_, (alpha, beta, gamma))
     return wigner_d_matrix(order, alpha, beta, gamma, dtype=dtype)
-
 
 @cast_torch_tensor
 def rot_z(gamma):
@@ -69,7 +55,6 @@ def rot_z(gamma):
         [0,           0,          1],
     ], dtype=gamma.dtype)
 
-
 @cast_torch_tensor
 def rot_y(beta):
     return torch.tensor([
@@ -77,9 +62,6 @@ def rot_y(beta):
         [0,          1, 0        ],
         [-sin(beta), 0, cos(beta)],
     ], dtype=beta.dtype)
-
-
-# ── vectorised x_to_alpha_beta ────────────────────────────────────────────────
 
 def x_to_alpha_beta(x: torch.Tensor, eps=1e-8):
     norms = x.norm(dim=-1, keepdim=True).clamp(min=eps)
@@ -100,11 +82,9 @@ def x_to_alpha_beta(x: torch.Tensor, eps=1e-8):
 
     return alpha, beta 
 
-
 def rot(alpha, beta, gamma):
     """ZYZ Euler angles rotation."""
     return rot_z(alpha) @ rot_y(beta) @ rot_z(gamma)
-
 
 def compose(a1, b1, c1, a2, b2, c2):
     comp = rot(a1, b1, c1) @ rot(a2, b2, c2)
@@ -113,7 +93,6 @@ def compose(a1, b1, c1, a2, b2, c2):
     rotz = rot(0, -b, -a) @ comp
     c    = atan2(rotz[1, 0], rotz[0, 0])
     return a, b, c
-
 
 def spherical_harmonics(order, alpha, beta, dtype=None):
     return get_spherical_harmonics(order, theta=(pi - beta), phi=alpha)

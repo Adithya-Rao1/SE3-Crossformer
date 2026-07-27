@@ -1,24 +1,3 @@
-"""
-compare_ttest.py
-------------------
-Two-sample t-test comparing the per-trial test MAE ("accuracy") of the
-custom SE3InterNeighborhoodTransformer against the se3-transformer-pytorch
-(authors') model, using the trial_maes.csv files written by
-predict_custom_model.py and predict_se3_transformer_pytorch.py.
-
-By default this runs Welch's t-test (equal_var=False), which does not
-assume the two models' MAE variances are equal across trials -- generally
-the safer default for comparing two different architectures. Pass
---equal_var to run the classic pooled-variance Student's t-test instead.
-
-Usage:
-    python compare_ttest.py \
-        --model_a predictions_custom/trial_maes.csv \
-        --model_b predictions_se3_transformer_pytorch/trial_maes.csv \
-        --label_a "Custom SE3InterNeighborhoodTransformer" \
-        --label_b "se3-transformer-pytorch (authors)"
-"""
-
 import argparse
 import csv
 import json
@@ -27,7 +6,6 @@ import math
 import numpy as np
 from scipy import stats
 
-
 def read_trial_maes(path):
     maes = []
     with open(path, newline="") as f:
@@ -35,7 +13,6 @@ def read_trial_maes(path):
         for row in reader:
             maes.append(float(row["mae"]))
     return maes
-
 
 def confidence_interval_95(values):
     values = np.asarray(values, dtype=float)
@@ -47,7 +24,6 @@ def confidence_interval_95(values):
     t_crit = stats.t.ppf(0.975, df=n - 1)
     half_width = float(t_crit * std / math.sqrt(n))
     return mean, half_width
-
 
 def main():
     parser = argparse.ArgumentParser()

@@ -12,7 +12,6 @@ from datetime import datetime
 import torch
 import numpy as np
 
-# ── project root on path ────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -28,7 +27,6 @@ from src.profiling.gpu_monitor                        import GpuMonitor
 from src.profiling.plot_results                       import plot_all
 
 
-# ── logging setup ───────────────────────────────────────────────────────────
 RESULTS_DIR = ROOT / "profiling_results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -103,7 +101,7 @@ def build_loaders(args):
         target_idx = args.target,
         batch_size = args.batch_size,
         r          = args.data_root,
-        device     = torch.device("cpu"),   # keep on CPU; experiments do H2D themselves
+        device     = torch.device("cpu"),   
     )
 
 
@@ -127,7 +125,6 @@ def main():
 
     results: dict = {"meta": vars(args), "timestamp": timestamp, "experiments": {}}
 
-    # ── GPU monitor (background thread) ─────────────────────────────────────
     gpu_monitor = None
     if device.type == "cuda":
         gpu_monitor = GpuMonitor(poll_interval=1.0)
@@ -136,7 +133,6 @@ def main():
 
     train_loader, val_loader, _ = build_loaders(args)
 
-    # ── run experiments ──────────────────────────────────────────────────────
     exp_map = {
         "timing":            (run_timing_experiment,
                               dict(loader=train_loader, args=args, device=device,
@@ -186,7 +182,6 @@ def main():
             log.error(f"  ✗ {name} FAILED: {exc}", exc_info=True)
             results["experiments"][name] = {"error": str(exc)}
 
-    # ── stop GPU monitor ─────────────────────────────────────────────────────
     if gpu_monitor is not None:
         gpu_monitor.stop()
         gpu_data = gpu_monitor.get_results()
@@ -194,12 +189,10 @@ def main():
         log.info(f"\nGPU utilization samples collected: {len(gpu_data.get('util_pct', []))}")
         _log_summary("gpu_util", gpu_data)
 
-    # ── save JSON results ────────────────────────────────────────────────────
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2, default=_json_serialise)
     log.info(f"\nResults saved → {json_path}")
 
-    # ── plots ────────────────────────────────────────────────────────────────
     plot_dir = RESULTS_DIR / f"plots_{timestamp}"
     plot_dir.mkdir(exist_ok=True)
     try:
@@ -211,8 +204,6 @@ def main():
     log.info(f"\nLog file → {log_path}")
     log.info("Profiling complete.")
 
-
-# ── helpers ──────────────────────────────────────────────────────────────────
 
 def _json_serialise(obj):
     if isinstance(obj, (np.integer,)):

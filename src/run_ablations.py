@@ -1,21 +1,3 @@
-"""
-run_ablations.py
------------------
-Runs the three ablation sweeps (graph construction, model architecture, RBF)
-sequentially against train.py, writing each run's metrics to its own
-directory and logging a summary CSV across all runs.
-
-Fixed-variable design per ablation group:
-    graph_construction : model_type="inter",  rbf_type="gsfb"  | sweep partition_type
-    model_architecture  : partition_type="spectral", rbf_type="gsfb" | sweep model_type
-    rbf                  : model_type="inter",  partition_type="spectral" | sweep rbf_type
-
-Usage:
-    python run_ablations.py --epochs 100 --target 1 --batch_size 32 --accum_steps 8
-    python run_ablations.py --groups graph_construction rbf   # run subset of groups
-    python run_ablations.py --dry_run                          # print commands only
-"""
-
 import argparse
 import csv
 import os
@@ -26,20 +8,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-
-# ---------------------------------------------------------------------------
-# Ablation definitions
-# ---------------------------------------------------------------------------
-
-LAYERS = ["inter", "intra_only"]                # model architecture sweep
-PARTITION_TYPES = ["spectral", "knn"]            # graph construction sweep
-RBFS = ["grbf", "gsfb"]                   # RBF sweep
-
+LAYERS = ["inter", "intra_only"]                
+PARTITION_TYPES = ["spectral", "knn"]        
+RBFS = ["grbf", "gsfb"]                  
 
 @dataclass
 class AblationRun:
-    group: str            # "graph_construction" | "model_architecture" | "rbf"
-    swept_param: str      # name of the parameter being varied in this run
+    group: str            
+    swept_param: str     
     partition_type: str
     model_type: str
     rbf_type: str
@@ -55,12 +31,6 @@ class AblationRun:
 
 
 def build_ablation_plan() -> list:
-    """Builds the full sequential list of ablation runs, in the fixed-vs-swept
-    configuration requested:
-      1) graph_construction: model_type=inter, rbf_type=gsfb, sweep partition_type
-      2) model_architecture:  partition_type=spectral, rbf_type=gsfb, sweep model_type
-      3) rbf:                  model_type=inter, partition_type=spectral, sweep rbf_type
-    """
     plan = []
 
     for pt in PARTITION_TYPES:
@@ -92,15 +62,9 @@ def build_ablation_plan() -> list:
 
     return plan
 
-
-# ---------------------------------------------------------------------------
-# Execution helpers
-# ---------------------------------------------------------------------------
-
 TEST_MAE_RE = re.compile(
     r"Test MAE over \d+ trials?:\s*([-\d.eE]+)\s*±\s*([-\d.eE]+)"
 )
-
 
 def build_command(run: AblationRun, args: argparse.Namespace, metrics_dir: str) -> list:
     cmd = [
@@ -164,9 +128,6 @@ def run_single_ablation(run: AblationRun, args: argparse.Namespace) -> dict:
         return result_row
 
     start = time.time()
-    # Stream stdout/stderr line-by-line straight to the log file (rather than
-    # buffering an entire day's worth of output in memory) and mirror it to
-    # the console so long runs are still watchable live.
     with open(log_path, "w") as log_file:
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
@@ -198,7 +159,6 @@ def run_single_ablation(run: AblationRun, args: argparse.Namespace) -> dict:
 
     return result_row
 
-
 def write_summary_csv(rows: list, path: str):
     fieldnames = [
         "group", "swept_param", "partition_type", "model_type", "rbf_type",
@@ -212,11 +172,6 @@ def write_summary_csv(rows: list, path: str):
             writer.writerow(row)
     print(f"\nSummary written to {path}")
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SE3 transformer ablation sweeps.")
 
@@ -227,7 +182,6 @@ def parse_args():
                          choices=["graph_construction", "model_architecture", "rbf"],
                          help="Which ablation groups to run, in order.")
 
-    # Fixed training hyperparameters passed through to every run.
     parser.add_argument("--target", type=int, default=1)
     parser.add_argument("--num_parts", type=int, default=4)
     parser.add_argument("--max_degree", type=int, default=2)
@@ -255,14 +209,12 @@ def parse_args():
 
     return parser.parse_args()
 
-
 def _cuda_available() -> bool:
     try:
         import torch
         return torch.cuda.is_available()
     except ImportError:
         return False
-
 
 def main():
     args = parse_args()

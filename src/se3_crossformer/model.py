@@ -21,36 +21,7 @@ from src.se3_crossformer.spectral_partition import (
 )
 from src.se3_crossformer.knn_partition import knn_partition
 from src.se3_crossformer.spherical_harm import get_spherical_harmonics
-from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
-from src.se3_crossformer.irr_rep import x_to_alpha_beta
-
-from e3nn import o3
-
-def _cartesian_dipole(n: torch.Tensor) -> torch.Tensor:
-    """n: [N,3] unit vectors -> [N,3] Cartesian dipole (== n itself)."""
-    return n
-
-def fit_sh_to_cartesian(l: int, target_fn, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
-    """
-    Generalizes the old hand-derived SH1_TO_CARTESIAN and the lstsq-fit
-    SH2_TO_CARTESIAN into one routine, fit directly against this codebase's
-    own get_spherical_harmonics (theta = pi - beta convention included).
-    """
-    n = torch.randn(n_samples, 3, dtype=torch.float64)
-    n = n / n.norm(dim=-1, keepdim=True)
-
-    alpha, beta = x_to_alpha_beta(n)
-    theta = math.pi - beta
-
-    Y_l = get_spherical_harmonics(l, theta=theta, phi=alpha)   # [N, 2l+1]
-    T   = target_fn(n)                                          # [N, out_dim]
-
-    M, *_ = torch.linalg.lstsq(Y_l, T)
-    resid = (Y_l @ M - T).abs().max().item()
-    assert resid < tol, f"SH{l}->Cartesian fit residual too high: {resid:.2e}"
-
-    return M.T.float()
-
+from src.se3_crossformer.se3_utils import *
 
 if os.path.exists("sh1_cartesian.pt"):
     SH1_TO_CARTESIAN = torch.load("sh1_cartesian.pt")
@@ -63,73 +34,6 @@ if os.path.exists("sh2_cartesian.pt"):
 else:
     SH2_TO_CARTESIAN = fit_sh_to_cartesian(2, _cartesian_quadrupole)
     torch.save(SH2_TO_CARTESIAN, "sh2_cartesian.pt")
-
-class IrrepLinear(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.weight = nn.Linear(channels, channels, bias=False)
-
-    def forward(self, x):
-        # x: [N,C,m]
-        x = x.transpose(1,2)
-        x = self.weight(x)
-        return x.transpose(1,2)
-
-class EquivariantReadout(nn.Module):
-    def __init__(self, C: int, hidden: int = 64):
-        super().__init__()
-        self.proj = nn.Linear(C, 1, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(-1, -2)     
-        x = self.proj(x)             
-        return x.squeeze(-1)        
-
-
-class EquivariantNormReadout(nn.Module):
-    def __init__(self, C: int, hidden: int = 64, eps: float = 1e-8):
-        super().__init__()
-        self.eps = eps
-        self.equiv_proj = nn.Linear(C, hidden, bias=False)   
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        v = self.equiv_proj(x.transpose(-1, -2))              
-        v = v.transpose(-1, -2)                               
-        norms = torch.sqrt((v ** 2).sum(dim=-1) + self.eps)  
-        return self.mlp(norms).squeeze(-1)                    
-
-def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
-    """Return the CG matrix for a single J from the cached dict."""
-    from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
-    return clebsch_gordan_matrix(l, k)[J]
-
-def _equivariant_weight_single_J(
-    x:   torch.Tensor,  
-    l:   int,
-    k:   int,
-    J:   int,
-    phi: torch.Tensor,  
-) -> torch.Tensor:     
-
-    device, dtype = x.device, x.dtype
-
-    if x.shape[0] == 0:
-        return torch.zeros(0, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype)
-
-    cg    = clebsch_gordan_matrix(l, k)
-    Q_J   = cg[J].to(device=device, dtype=dtype) 
-
-    alphas, betas = x_to_alpha_beta(x)            
-    Y_J = get_spherical_harmonics(J, theta=(math.pi - betas), phi=alphas) 
-
-    QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)
-    had = phi * QTY                               
-    return had.view(x.shape[0], 2 * l + 1, 2 * k + 1)
 
 class SE3BaseTransformer(nn.Module):
     def __init__(
@@ -290,10 +194,10 @@ class SE3BaseTransformer(nn.Module):
     ) -> Dict[int, torch.Tensor]:
         B = int(batch.max().item()) + 1
 
-        m = atomic_masses.unsqueeze(-1)                                        # [N, 1]
-        mass_sum = torch_scatter.scatter_add(m, batch, dim=0, dim_size=B)      # [B, 1]
-        weighted_sum = torch_scatter.scatter_add(m * x, batch, dim=0, dim_size=B)  # [B, 3]
-        center = weighted_sum / mass_sum.clamp(min=1e-8)                        # [B, 3]
+        m = atomic_masses.unsqueeze(-1)                                        
+        mass_sum = torch_scatter.scatter_add(m, batch, dim=0, dim_size=B)    
+        weighted_sum = torch_scatter.scatter_add(m * x, batch, dim=0, dim_size=B)  
+        center = weighted_sum / mass_sum.clamp(min=1e-8)                     
 
         x_rel  = x - center[batch]                              
 
@@ -642,8 +546,6 @@ class SE3InterNeighborhoodLayer(nn.Module):
                 phi_nets = self.msg_to_phi[key]
                 C_k      = m_k.shape[1]
                 dim_k    = 2 * k + 1
-
-                # m_k_flat = m_k.reshape(S, C_k * dim_k)
 
                 for J_str, phi_net in phi_nets.items():
                     J = int(J_str)

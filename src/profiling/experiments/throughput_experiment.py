@@ -1,13 +1,3 @@
-"""
-throughput_experiment.py
-------------------------
-Experiments 11 & 12: Track nodes/sec, edges/sec, samples/sec, and
-spherical harmonic accesses/sec.
-
-Also records per-batch graph statistics (nodes, edges, avg degree) to help
-correlate throughput with graph size.
-"""
-
 import time
 import logging
 from typing import Dict, Any, List
@@ -38,15 +28,11 @@ def _cuda_sync():
 
 
 def _count_sh_accesses(num_edges: int, max_degree: int, num_layers: int) -> int:
-    """
-    Estimate: for each edge, for each (l, k) pair, for each J in |l-k|..l+k,
-    we compute Y_J.  Per layer, per edge.
-    """
     sh_per_edge = 0
     for l in range(max_degree + 1):
         for k in range(max_degree + 1):
             for J in range(abs(l - k), l + k + 1):
-                sh_per_edge += 1   # one Y_J call
+                sh_per_edge += 1   
     return sh_per_edge * num_edges * num_layers
 
 
@@ -56,9 +42,6 @@ def run_throughput_experiment(
     device: torch.device,
     num_batches: int = 20,
 ) -> Dict[str, Any]:
-    """
-    Returns dict with throughput metrics.
-    """
     log.info(f"  Throughput experiment: {num_batches} batches on {device}")
 
     import sys
@@ -79,7 +62,6 @@ def run_throughput_experiment(
     ).to(device)
     model.eval()
 
-    # Per-batch stats
     batch_nodes:   List[int]   = []
     batch_edges:   List[int]   = []
     batch_samples: List[int]   = []
@@ -148,7 +130,7 @@ def run_throughput_experiment(
     avg_edges_per_graph = total_edges   / max(total_samples, 1)
     avg_degree          = total_edges   / max(total_nodes,   1)
 
-    log.info(f"\n  ─── Throughput summary ───────────────────────────────")
+    log.info(f"\n Throughput summary")
     log.info(f"  nodes/s  : {nodes_per_sec:.0f}")
     log.info(f"  edges/s  : {edges_per_sec:.0f}")
     log.info(f"  samples/s: {samples_per_sec:.2f}")
@@ -163,12 +145,10 @@ def run_throughput_experiment(
         "batch_samples":            batch_samples,
         "batch_times_s":            batch_times,
         "batch_sh_estimates":       batch_sh_est,
-        # aggregate throughput
         "nodes_per_sec":            nodes_per_sec,
         "edges_per_sec":            edges_per_sec,
         "samples_per_sec":          samples_per_sec,
         "sh_accesses_per_sec":      sh_per_sec,
-        # graph size stats
         "avg_nodes_per_graph":      avg_nodes_per_graph,
         "avg_edges_per_graph":      avg_edges_per_graph,
         "avg_degree":               avg_degree,

@@ -1,17 +1,3 @@
-"""
-batch_scaling.py
-----------------
-Experiment 6: Batch-size scaling [1, 2, 4, 8, 16, 32, 64, 128, 256, 512].
-
-Interpretation:
-  - samples/sec rises with batch size → GPU was under-utilised (fixed kernel-launch
-    overhead dominates at small batch sizes).
-  - samples/sec plateaus → memory-bandwidth bound or fully compute-bound.
-  - OOM at large sizes → GPU memory is the hard limit.
-
-Only the forward pass is timed (no backward) to isolate throughput.
-"""
-
 import time
 import logging
 from typing import Dict, Any, List
@@ -42,10 +28,6 @@ def run_batch_scaling_experiment(
     device: torch.device,
     num_batches: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Returns dict with keys:
-        batch_sizes, samples_per_sec, mean_forward_time_s, oom_at
-    """
     log.info(f"  Batch scaling experiment on {device}")
 
     import sys
@@ -63,7 +45,6 @@ def run_batch_scaling_experiment(
         device   = torch.device("cpu"),
     )
     dataset.y = dataset.y[:, args.target]
-    # Limit to a workable subset
     dataset = dataset[:min(len(dataset), 2048)]
 
     model = SE3InterNeighborhoodTransformer(

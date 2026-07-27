@@ -1,21 +1,3 @@
-"""
-graph_construction.py
----------------------
-Experiment 8 & 12: Time each sub-step of graph construction and compare
-against the forward pass time.
-
-Sub-steps timed:
-  • spectral_partition    (Laplacian + eigh + k-means)
-  • subgraph_center_of_mass
-  • build_neighbor_info   (intra-subgraph adjacency list)
-  • initial_message       (feature aggregation into subgraph messages)
-  • total graph build
-  • model forward (for ratio comparison)
-
-Also records per-step wall time and notes whether steps happen once per
-molecule, per batch, or per forward pass.
-"""
-
 import time
 import logging
 from typing import Dict, Any, List
@@ -51,9 +33,6 @@ def run_graph_construction_experiment(
     device: torch.device,
     num_batches: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Returns dict with sub-step timing lists and means.
-    """
     log.info(f"  Graph construction experiment: {num_batches} batches")
 
     import sys
@@ -103,7 +82,6 @@ def run_graph_construction_experiment(
         N           = pos.shape[0]
         B           = int(graph_batch.max().item()) + 1
 
-        # ── per-graph graph construction ───────────────────────────────────
         build_start = time.perf_counter()
 
         ptr = [0]
@@ -122,21 +100,18 @@ def run_graph_construction_experiment(
             pos_g  = pos[lo:hi]
             am_g   = am[lo:hi]
 
-            # 1. Spectral partition
             t0 = time.perf_counter()
             n2s = spectral_partition(ei_g, n_g, args.num_parts).to(device)
             _cuda_sync()
             t1 = time.perf_counter()
             t_spectral_batch += (t1 - t0)
 
-            # 2. Center of mass
             t0 = time.perf_counter()
             x_cm = subgraph_center_of_mass(pos_g, am_g, n2s, args.num_parts)
             _cuda_sync()
             t1 = time.perf_counter()
             t_com_batch += (t1 - t0)
 
-            # 3. Neighbor info (Python loop in model._build_neighbor_info)
             t0 = time.perf_counter()
             _ = model._build_neighbor_info(ei_g, n2s, n_g)
             _cuda_sync()
@@ -150,7 +125,6 @@ def run_graph_construction_experiment(
         times_neighbor.append(t_neighbor_batch)
         times_total_build.append(build_end - build_start)
 
-        # ── forward pass ──────────────────────────────────────────────────
         _cuda_sync()
         t_fwd0 = time.perf_counter()
         with torch.no_grad():
@@ -188,7 +162,6 @@ def run_graph_construction_experiment(
         "mean_total_graph_build_s":     mean_build,
         "mean_forward_s":               mean_forward,
         "graph_build_to_forward_ratio": build_fwd_ratio,
-        # Frequency metadata
         "frequency_notes": {
             "spectral_partition":       "once per molecule per forward pass (not cached)",
             "center_of_mass":           "once per molecule per forward pass (not cached)",

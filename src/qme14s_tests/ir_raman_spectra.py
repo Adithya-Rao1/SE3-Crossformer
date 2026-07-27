@@ -24,7 +24,7 @@ def normal_modes_from_hessian(hessian, z, unit_factor=HARTREE_BOHR2_AMU_TO_CM1,
     m3 = np.repeat(masses, 3)
     inv_sqrt_m = 1.0 / np.sqrt(m3)
     mw_hessian = hessian * np.outer(inv_sqrt_m, inv_sqrt_m)
-    mw_hessian = 0.5 * (mw_hessian + mw_hessian.T)  # enforce symmetry
+    mw_hessian = 0.5 * (mw_hessian + mw_hessian.T) 
 
     eigvals, eigvecs = np.linalg.eigh(mw_hessian)
 
@@ -32,7 +32,6 @@ def normal_modes_from_hessian(hessian, z, unit_factor=HARTREE_BOHR2_AMU_TO_CM1,
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
 
-    # drop the n_zero_modes closest to zero (translation + rotation)
     keep = slice(n_zero_modes, None)
     eigvals_vib = eigvals[keep]
     eigvecs_vib = eigvecs[:, keep]
@@ -73,10 +72,6 @@ def raman_spectrum(pos, z, modes_cart, polar_model, device, delta=0.01, cutoff=5
     return np.array(activities)
 
 def ir_spectrum(pos, z, modes_cart, dedipole_model, device, cutoff=5.0, num_parts=4):
-    """
-    Projection onto normal mode Q_k:
-        d(mu)/dQ_k = sum_i  dedipole_i @ mode_disp_i
-    """
     n = pos.shape[0]
     pred = predict_single(pos, z, None, dedipole_model, device,
                            cutoff=cutoff, num_parts=num_parts)["dipole_derivative"]  
@@ -89,9 +84,6 @@ def ir_spectrum(pos, z, modes_cart, dedipole_model, device, cutoff=5.0, num_part
     return np.array(intensities)
 
 def load_reference_spectrum(h5_path, group_name, kind):
-    """
-    Placeholder loader for the QMe14S reference IR/Raman spectrum of one molecule. 
-    """
     freq_key = f"{kind}_freq_cm"
     val_key = "ir_intensity" if kind == "ir" else "raman_activity"
     with h5py.File(h5_path, "r") as f:

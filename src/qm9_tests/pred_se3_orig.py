@@ -1,37 +1,3 @@
-"""
-predict_se3_transformer_pytorch.py
-------------------------------------
-Evaluate checkpoints from the `se3-transformer-pytorch` package
-(https://github.com/lucidrains/se3-transformer-pytorch, pip install
-se3-transformer-pytorch) on the same QM9 regression target, using the same
-train/val/test split logic as train.py / predict_custom_model.py.
-
-IMPORTANT — read before running
---------------------------------
-`se3-transformer-pytorch` is a general equivariant backbone; its README
-example returns PER-ATOM type-0/type-1 features, not a single molecule-level
-scalar. There is no official QM9 regression head baked into the library, so
-this script wraps SE3Transformer in `SE3RegressionWrapper`:
-
-    SE3Transformer(...)  ->  per-atom scalar features (b, n, 1)
-                          ->  masked mean-pool over atoms (b, 1)
-                          ->  nn.Linear(1, 1) calibration head (b, 1)
-
-If the checkpoint you downloaded from the authors' codebase was trained with
-a *different* readout (e.g. sum-pool, an MLP head, multiple output channels
-mapped to all 19 targets at once, etc.), you MUST edit `SE3RegressionWrapper`
-to match, or `load_state_dict` will fail / silently load into the wrong
-shapes. Look at the checkpoint's keys first:
-
-    python -c "import torch; sd = torch.load('authors_trial0.pt', map_location='cpu'); print(list(sd.keys()))"
-
-and adjust the wrapper accordingly.
-
-Usage:
-    python predict_se3_transformer_pytorch.py --target 0 --trials 5 \
-        --checkpoint_dir ./authors_checkpoints --data_root ./data
-"""
-
 import argparse
 import csv
 import json
@@ -48,10 +14,9 @@ from se3_transformer_pytorch import SE3Transformer
 
 from src.train import load_qm9, _filter_small_graphs
 
-# Atomic numbers present in QM9 (H, C, N, O, F) -> contiguous token ids.
 ATOM_VOCAB = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}
 NUM_TOKENS = len(ATOM_VOCAB)
-NUM_EDGE_TOKENS = 5  # bond orders 0 (none), 1, 2, 3, aromatic(~1.5 -> rounded)
+NUM_EDGE_TOKENS = 5  
 
 
 def confidence_interval_95(values):
@@ -67,12 +32,6 @@ def confidence_interval_95(values):
 
 
 class SE3RegressionWrapper(nn.Module):
-    """SE3Transformer backbone + masked mean-pool + linear readout.
-
-    See module docstring: adjust this class to match the authors'
-    checkpoint if their readout differs.
-    """
-
     def __init__(self, dim=32, depth=2, num_degrees=2, dim_head=16, heads=4):
         super().__init__()
         self.backbone = SE3Transformer(
@@ -91,27 +50,22 @@ class SE3RegressionWrapper(nn.Module):
         self.readout = nn.Linear(1, 19)
 
     def forward(self, atoms, coors, mask, edges):
-        # (b, n, 1) per-atom type-0 features
         per_atom = self.backbone(atoms, coors, mask, edges=edges, return_type=0)
-        per_atom = per_atom.squeeze(-1)  # (b, n)
+        per_atom = per_atom.squeeze(-1)  
 
         mask_f = mask.float()
         pooled = (per_atom * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
-        pooled = pooled.unsqueeze(-1)  # (b, 1)
-        return self.readout(pooled).squeeze(-1)  # (b,)
+        pooled = pooled.unsqueeze(-1) 
+        return self.readout(pooled).squeeze(-1)
 
 
 def batch_to_dense(batch, device, max_nodes=None):
-    """Convert a PyG batch (from CustomQM9Dataset, atomic-number x, bond-order
-    edge_attr) into the dense (atoms, coors, mask, edges) tensors expected by
-    se3-transformer-pytorch."""
-    z = batch.x.long().to(device)  # atomic numbers, shape [N_total]
+    z = batch.x.long().to(device) 
     unknown = torch.tensor(
         [ATOM_VOCAB.get(int(zi), -1) for zi in z], device=device
     )
     valid = unknown >= 0
     if not valid.all():
-        # Drop atoms outside the known vocab (rare for QM9's H/C/N/O/F set).
         pass
 
     tokens = torch.zeros_like(z)
@@ -128,7 +82,6 @@ def batch_to_dense(batch, device, max_nodes=None):
     ).long()
 
     return atoms_dense, coors_dense, mask, edges_dense
-
 
 @torch.no_grad()
 def predict_and_record(model, loader, device, out_csv):
@@ -150,9 +103,6 @@ def predict_and_record(model, loader, device, out_csv):
         atoms, coors, mask, edges = batch_to_dense(batch, device)
         pred = model(atoms, coors, mask, edges)
 
-        # batch_to_dense reindexes per the *original* batch, not the
-        # small-graph-filtered one; target/graph_batch from _filter_small_graphs
-        # already correspond 1:1 with batch.y since num_parts=1 keeps all graphs.
         abs_err = (pred - target).abs()
 
         for p, t, e in zip(pred.tolist(), target.tolist(), abs_err.tolist()):
@@ -210,7 +160,7 @@ def main():
             dim=args.dim, depth=args.depth, num_degrees=args.num_degrees
         ).to(device)
         state_dict = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state_dict, strict=False)  # see module docstring
+        model.load_state_dict(state_dict, strict=False)  
 
         out_csv = os.path.join(args.out_dir, f"predictions_trial{trial}.csv")
         mae = predict_and_record(model, test_loader, device, out_csv)

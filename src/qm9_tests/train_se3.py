@@ -1,61 +1,7 @@
-"""
-train_se3_transformer_pytorch.py
-----------------------------------
-Trains the `se3-transformer-pytorch` (lucidrains) model on QM9, mirroring
-train.py as closely as possible so the two models are directly comparable:
-
-  - same load_qm9() split (110000 / 10000 / rest), same --target semantics
-  - same gradient-accumulation loop (effective batch = batch_size * accum_steps)
-  - same Adam + CosineAnnealingLR schedule
-  - same 5-trial loop with per-trial seeding (torch.manual_seed(trial)) and
-    best-val-MAE checkpointing
-  - same confidence_interval_95 across trials
-
-Checkpoints are written as `authors_trial{trial}.pt`, matching the default
-`--checkpoint_template` in predict_se3_transformer_pytorch.py, so you can
-run that script unmodified afterwards.
-
-Model/data notes (see predict_se3_transformer_pytorch.py docstring for the
-full explanation):
-  - se3-transformer-pytorch has no built-in QM9 regression head, so this
-    reuses SE3RegressionWrapper (backbone -> masked mean-pool -> linear)
-    from predict_se3_transformer_pytorch.py.
-  - Inputs are converted to dense (atoms, coors, mask, edges) tensors via
-    batch_to_dense, also reused from that script, so both scripts stay in
-    sync on the data adapter.
-  - Dense edge tensors are O(n^2) per graph, so this defaults to a smaller
-    physical batch size than the custom model and a larger accum_steps to
-    reach the same effective batch size -- adjust --batch_size /
-    --accum_steps together if you want to match the custom model's
-    effective batch size exactly.
-
-Usage:
-    python train_se3_transformer_pytorch.py --target 0 --epochs 300 \
-        --batch_size 8 --accum_steps 32 --data_root ./data
-
-If you hit CUDA OOM (this library's dense O(n^2) kernel over per-batch
-variable-size padding is memory-hungry and prone to allocator fragmentation),
-try in this order:
-    1. Lower --batch_size further (e.g. 4) and raise --accum_steps to
-       compensate, to keep the effective batch size the same.
-    2. Lower --dim / --heads / --dim_head / --num_degrees.
-    3. Lower --empty_cache_every (e.g. to 1, the default) if you raised it.
-    4. As a last resort, run with fewer --min_nodes filtering so the largest
-       molecules (up to 29 atoms in QM9) are excluded, capping worst-case N.
-The script already sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and
-skips (rather than crashes on) any individual batch that still OOMs.
-"""
-
 import argparse
 import math
 import os
 
-# Must be set before CUDA is initialized (i.e. before any tensor touches the
-# GPU). This library pads every batch to that batch's own max atom count, so
-# tensor shapes change batch-to-batch; the caching allocator fragments badly
-# under that pattern, and this flag lets it recycle fragments instead of
-# growing the pool indefinitely. Override by exporting the env var yourself
-# before running if you want a different value.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
@@ -84,21 +30,6 @@ def confidence_interval_95(values):
 
 def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
                  empty_cache_every=1, monitor: SystemMonitor = None):
-    """Gradient-accumulation training epoch, mirroring train.py::train_epoch.
-
-    Two additions vs. a naive port, both aimed at the OOM behavior this
-    library exhibits on variable-size padded batches:
-      - torch.cuda.empty_cache() every `empty_cache_every` optimizer steps,
-        to return freed fragments to the allocator's shared pool instead of
-        letting them pile up as batch shapes keep changing.
-      - a per-batch OOM guard: if a single unlucky (large-N) batch overflows,
-        we drop that batch, clear the cache, and keep training instead of
-        losing the whole epoch/trial.
-
-    monitor: optional SystemMonitor, sample()d once per micro-batch and
-             commit()ted once per accumulated step (mean over that step's
-             micro-batches), matching train.py's monitoring.
-    """
     model.train()
     total_loss = 0.0
     n_graphs = 0
@@ -121,7 +52,7 @@ def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
             atoms, coors, mask, edges = batch_to_dense(batch, device)
             pred = model(atoms, coors, mask, edges)
             if pred.shape[0] != target.shape[0]:
-                            continue # Skipping last batch
+                            continue
             loss = nn.functional.l1_loss(pred, target) / accum_steps
             loss.backward()
         except torch.cuda.OutOfMemoryError:
@@ -174,7 +105,6 @@ def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
 
     return total_loss / max(n_graphs, 1)
 
-
 @torch.no_grad()
 def evaluate(model, loader, device, min_nodes, empty_cache_every=1):
     model.eval()
@@ -196,7 +126,7 @@ def evaluate(model, loader, device, min_nodes, empty_cache_every=1):
             atoms, coors, mask, edges = batch_to_dense(batch, device)
             pred = model(atoms, coors, mask, edges)
             if pred.shape[0] != target.shape[0]:
-                continue # Skipping last batch
+                continue
             mae = nn.functional.l1_loss(pred, target).item()
         except torch.cuda.OutOfMemoryError:
             n_atoms = atoms.shape[1] if atoms is not None else "?"

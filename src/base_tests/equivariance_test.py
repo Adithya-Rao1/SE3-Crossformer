@@ -14,10 +14,8 @@ ATOL = 1e-9
 RTOL = 1e-9
 
 def random_rotation_matrix(dtype=torch.double, generator=None) -> torch.Tensor:
-    """Uniformly-ish sampled proper rotation matrix (det = +1) via QR."""
     A = torch.randn(3, 3, dtype=torch.double, generator=generator)
     Q, R = torch.linalg.qr(A)
-    # Fix sign ambiguity of QR so Q is Haar-ish distributed.
     d = torch.diagonal(R).sign()
     Q = Q * d
     if torch.det(Q) < 0:
@@ -26,9 +24,7 @@ def random_rotation_matrix(dtype=torch.double, generator=None) -> torch.Tensor:
 
 def qvec_to_matrix(q: torch.Tensor) -> torch.Tensor:
     """
-    Convert the 5-component traceless symmetric quadrupole representation
-    [Qxx, Qxy, Qxz, Qyy, Qyz] (matches _cartesian_quadrupole in model.py)
-    into a full [..., 3, 3] symmetric traceless matrix.
+    Convert the 5-component traceless symmetric quadrupole representation into a full symmetric traceless matrix.
     """
     Qxx, Qxy, Qxz, Qyy, Qyz = q.unbind(-1)
     Qzz = -Qxx - Qyy

@@ -8,17 +8,6 @@ log = logging.getLogger("profiler.gpu_monitor")
 
 
 class GpuMonitor:
-    """
-    Runs ``nvidia-smi dmon`` in a subprocess and parses its output into
-    time-stamped lists.  Use as::
-
-        mon = GpuMonitor(poll_interval=1.0)
-        mon.start()
-        # ... do training ...
-        mon.stop()
-        results = mon.get_results()   # dict of lists
-    """
-
     def __init__(self, poll_interval: float = 1.0, gpu_id: int = 0):
         self.poll_interval = poll_interval
         self.gpu_id        = gpu_id
@@ -31,8 +20,6 @@ class GpuMonitor:
         self._power_w:          List[float] = []
         self._mem_used_mib:     List[float] = []
         self._lock             = threading.Lock()
-
-    # ── public API ────────────────────────────────────────────────────────
 
     def start(self):
         self._stop_event.clear()
@@ -64,7 +51,6 @@ class GpuMonitor:
             "mem_util_pct":      mem_util,
             "power_w":           power,
             "mem_used_mib":      mem_used,
-            # summary stats
             "mean_util_pct":     safe_mean(util),
             "max_util_pct":      safe_max(util),
             "mean_mem_util_pct": safe_mean(mem_util),
@@ -75,10 +61,7 @@ class GpuMonitor:
             "peak_mem_used_mib": safe_max(mem_used),
         }
 
-    # ── internal ──────────────────────────────────────────────────────────
-
     def _run(self):
-        """Poll loop – tries dmon first, falls back to manual smi queries."""
         try:
             self._run_dmon()
         except Exception as e:
@@ -86,15 +69,10 @@ class GpuMonitor:
             self._run_manual()
 
     def _run_dmon(self):
-        """
-        Uses ``nvidia-smi dmon -s pum -d <interval>`` which prints:
-          # gpu   pwr  gtemp  mtemp     sm    mem    enc    dec
-        columns vary by driver; we pick 'sm', 'mem', 'pwr' by index.
-        """
         cmd = [
             "nvidia-smi", "dmon",
             "-i", str(self.gpu_id),
-            "-s", "pum",          # p=power, u=utilisation, m=memory
+            "-s", "pum",         
             "-d", str(max(1, int(self.poll_interval))),
         ]
         proc = subprocess.Popen(
@@ -111,7 +89,6 @@ class GpuMonitor:
             if not line:
                 continue
 
-            # Capture header so we know column order
             if line.startswith("#"):
                 if "sm" in line.lower():
                     header_line = line.lstrip("#").split()
@@ -129,7 +106,6 @@ class GpuMonitor:
                     mem_util = float(parts[idx.get("mem", 2)])
                     power    = float(parts[idx.get("pwr", 0)])
                 else:
-                    # Fallback: assume gpu, pwr, sm, mem order
                     power    = float(parts[1])
                     util     = float(parts[3])
                     mem_util = float(parts[4])
@@ -139,17 +115,13 @@ class GpuMonitor:
                     self._util_pct.append(util)
                     self._mem_util_pct.append(mem_util)
                     self._power_w.append(power)
-                    self._mem_used_mib.append(0.0)   # dmon pum doesn't give MiB directly
+                    self._mem_used_mib.append(0.0)   
             except (ValueError, IndexError, KeyError):
                 continue
 
         proc.terminate()
 
     def _run_manual(self):
-        """
-        Falls back to querying individual nvidia-smi fields every poll_interval.
-        Works even if dmon is unsupported.
-        """
         t0 = time.perf_counter()
         query = (
             "utilization.gpu,utilization.memory,power.draw,memory.used"
