@@ -5,10 +5,6 @@ from typing import Union
 
 import torch
 
-# ---------------------------------------------------------------------------
-# Scalar helpers (pure Python, LRU-cached — never store tensors)
-# ---------------------------------------------------------------------------
-
 CACHE = {}
 
 def clear_spherical_harmonics_cache():

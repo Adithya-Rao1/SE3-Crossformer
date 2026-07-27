@@ -21,10 +21,10 @@ def build_laplacian(
     if edge_weight is None:
         edge_weight = torch.ones(edge_index.shape[1], device=edge_index.device)
 
-    deg = torch.zeros(num_nodes, device=edge_index.device)
+    deg = torch.zeros(num_nodes, device=edge_index.device, dtype=edge_weight.dtype)
     deg.scatter_add_(0, row, edge_weight)
 
-    A = torch.zeros(num_nodes, num_nodes, device=edge_index.device)
+    A = torch.zeros(num_nodes, num_nodes, device=edge_index.device, dtype=edge_weight.dtype)
     A[row, col] = edge_weight
 
     if normalized:

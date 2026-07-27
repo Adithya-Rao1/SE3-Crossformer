@@ -10,12 +10,12 @@ from src.se3_crossformer.se3_utils import RadialNetworkGSFB
 
 torch.manual_seed(0)
 
-ATOL = 1e-4
-RTOL = 1e-4
+ATOL = 1e-9
+RTOL = 1e-9
 
-def random_rotation_matrix(dtype=torch.float32, generator=None) -> torch.Tensor:
+def random_rotation_matrix(dtype=torch.double, generator=None) -> torch.Tensor:
     """Uniformly-ish sampled proper rotation matrix (det = +1) via QR."""
-    A = torch.randn(3, 3, dtype=torch.float64, generator=generator)
+    A = torch.randn(3, 3, dtype=torch.double, generator=generator)
     Q, R = torch.linalg.qr(A)
     # Fix sign ambiguity of QR so Q is Haar-ish distributed.
     d = torch.diagonal(R).sign()
@@ -40,12 +40,12 @@ def qvec_to_matrix(q: torch.Tensor) -> torch.Tensor:
 def make_toy_graph(n_atoms=12, n_atom_types=5, num_parts=4, seed=0):
     g = torch.Generator().manual_seed(seed)
 
-    x = torch.randn(n_atoms, 3, generator=g)
+    x = torch.randn(n_atoms, 3, generator=g).double()
 
     atom_type_idx = torch.randint(0, n_atom_types, (n_atoms,), generator=g)
     node_features = torch.nn.functional.one_hot(
         atom_type_idx, num_classes=n_atom_types
-    ).float()
+    ).double()
 
     # Ring topology as a base (guarantees connectivity), plus a few chords.
     ring_src = torch.arange(n_atoms)
@@ -59,9 +59,9 @@ def make_toy_graph(n_atoms=12, n_atom_types=5, num_parts=4, seed=0):
     dst = torch.cat([ring_dst, ring_src, chord_dst, chord_src])
     edge_index = torch.stack([src, dst], dim=0)
 
-    edge_attr = torch.randint(1, 4, (edge_index.shape[1], 1), generator=g).float()
+    edge_attr = torch.randint(1, 4, (edge_index.shape[1], 1), generator=g).double()
 
-    atomic_masses = torch.empty(n_atoms).uniform_(1.0, 16.0, generator=g)
+    atomic_masses = torch.empty(n_atoms, dtype=torch.double).uniform_(1.0, 16.0, generator=g)
 
     batch = torch.zeros(n_atoms, dtype=torch.long)
 
@@ -79,11 +79,11 @@ def build_model(model_cls, in_features, task, num_parts=4, max_degree=2):
         feature_dim=16,
         hidden_dim=32,
         num_parts=num_parts,
-        scalar_out_dim=3,
+        scalar_out_dim=1,
         task=task,
         partition_type="spectral",
     )
-    model.eval()
+    model.double().eval()
     return model
 
 def run(model, node_features, x, edge_index, edge_attr, atomic_masses, batch):
@@ -153,7 +153,7 @@ def test_translation_invariance(model_cls, task):
     )
     model = build_model(model_cls, in_features=n_atom_types, task=task)
 
-    t = torch.tensor([3.7, -2.1, 5.5])
+    t = torch.tensor([3.7, -2.1, 5.5], dtype=torch.double)
     x_shifted = x + t
 
     out_raw = run(model, node_features, x, edge_index, edge_attr, atomic_masses, batch)

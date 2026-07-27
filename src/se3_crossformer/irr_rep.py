@@ -81,37 +81,24 @@ def rot_y(beta):
 
 # ── vectorised x_to_alpha_beta ────────────────────────────────────────────────
 
-def x_to_alpha_beta(x: torch.Tensor):
-    """
-    Convert Cartesian direction(s) on the unit sphere to (alpha, beta).
+def x_to_alpha_beta(x: torch.Tensor, eps=1e-8):
+    norms = x.norm(dim=-1, keepdim=True).clamp(min=eps)
+    x_norm = x / norms
 
-    Supports:
-      • 1-D input  [3]        → returns (scalar, scalar)  [unchanged API]
-      • 2-D input  [N, 3]     → returns (Tensor[N], Tensor[N])  VECTORISED
-                                 (previously used a Python for-loop)
+    z_safe = x_norm[..., 2].clamp(-1 + 1e-6, 1 - 1e-6)
+    beta = torch.acos(z_safe)
 
-    The normalisation and clamping are done with tensor ops so the whole
-    batch runs as a single CUDA kernel launch rather than N sequential ones.
-    """
-    if x.ndim == 1:
-        # ── scalar path (unchanged) ───────────────────────────────────────
-        x = x / (x.norm() + 1e-8)
-        beta  = acos(x[2].clamp(-1.0 + 1e-7, 1.0 - 1e-7))
-        alpha = atan2(x[1], x[0])
-        return alpha, beta
+    xy_sq = x_norm[..., 0]**2 + x_norm[..., 1]**2
+    valid_phi = xy_sq > eps
 
-    # ── batched path [N, 3] ───────────────────────────────────────────────
-    # Normalise all rows in one shot
-    norms  = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)   # [N, 1]
-    x_norm = x / norms                                        # [N, 3]
+    alpha = torch.zeros_like(beta)
 
-    # Clamp z to the valid range of acos to avoid NaN at ±1
-    z_safe = x_norm[:, 2].clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    alpha[valid_phi] = torch.atan2(
+        x_norm[..., 1][valid_phi],
+        x_norm[..., 0][valid_phi]
+    )
 
-    alphas = torch.atan2(x_norm[:, 1], x_norm[:, 0])   # [N]
-    betas  = torch.acos(z_safe)                          # [N]
-
-    return alphas, betas                                  # both Tensor[N]
+    return alpha, beta 
 
 
 def rot(alpha, beta, gamma):

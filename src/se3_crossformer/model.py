@@ -24,56 +24,50 @@ from src.se3_crossformer.spherical_harm import get_spherical_harmonics
 from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
 from src.se3_crossformer.irr_rep import x_to_alpha_beta
 
-# Fixed change-of-basis: internal SH order (m=-1,0,+1) -> Cartesian (x,y,z).
-_C1 = math.sqrt(3.0 / (4 * math.pi))
-SH1_TO_CARTESIAN = torch.tensor([
-    [ 0.,  0., -1.],   # x = -Y_{+1}/c
-    [-1.,  0.,  0.],   # y = -Y_{-1}/c
-    [ 0.,  1.,  0.],   # z =  Y_{0} /c
-]) / _C1
+from e3nn import o3
 
-def _cartesian_quadrupole(n: torch.Tensor) -> torch.Tensor:
-    """
-    n: [N, 3] unit vectors -> [N, 5] traceless symmetric quadrupole
-    Q = n⊗n - I/3, independent components in order
-    [Qxx, Qxy, Qxz, Qyy, Qyz]  (Qzz = -Qxx-Qyy is implied by tracelessness).
-    """
-    X, Y, Z = n[:, 0], n[:, 1], n[:, 2]
-    Qxx = X * X - 1.0 / 3.0
-    Qyy = Y * Y - 1.0 / 3.0
-    Qxy = X * Y
-    Qxz = X * Z
-    Qyz = Y * Z
-    return torch.stack([Qxx, Qxy, Qxz, Qyy, Qyz], dim=-1)
+def _cartesian_dipole(n: torch.Tensor) -> torch.Tensor:
+    """n: [N,3] unit vectors -> [N,3] Cartesian dipole (== n itself)."""
+    return n
 
-def fit_sh2_to_cartesian(n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
+def fit_sh_to_cartesian(l: int, target_fn, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
     """
-    Fits the fixed linear map SH2 -> Cartesian-quadrupole by least squares
+    Generalizes the old hand-derived SH1_TO_CARTESIAN and the lstsq-fit
+    SH2_TO_CARTESIAN into one routine, fit directly against this codebase's
+    own get_spherical_harmonics (theta = pi - beta convention included).
     """
     n = torch.randn(n_samples, 3, dtype=torch.float64)
     n = n / n.norm(dim=-1, keepdim=True)
 
     alpha, beta = x_to_alpha_beta(n)
     theta = math.pi - beta
-    Y2 = get_spherical_harmonics(2, theta=theta, phi=alpha)   
-    T  = _cartesian_quadrupole(n)                             
 
-    M, *_ = torch.linalg.lstsq(Y2, T)
-    resid = (Y2 @ M - T).abs().max().item()
-    assert resid < tol, f"SH2->Cartesian fit residual too high: {resid:.2e}"
+    Y_l = get_spherical_harmonics(l, theta=theta, phi=alpha)   # [N, 2l+1]
+    T   = target_fn(n)                                          # [N, out_dim]
 
-    return M.T.float()  
+    M, *_ = torch.linalg.lstsq(Y_l, T)
+    resid = (Y_l @ M - T).abs().max().item()
+    assert resid < tol, f"SH{l}->Cartesian fit residual too high: {resid:.2e}"
+
+    return M.T.float()
+
+
+if os.path.exists("sh1_cartesian.pt"):
+    SH1_TO_CARTESIAN = torch.load("sh1_cartesian.pt")
+else:
+    SH1_TO_CARTESIAN = fit_sh_to_cartesian(1, _cartesian_dipole)
+    torch.save(SH1_TO_CARTESIAN, "sh1_cartesian.pt")
 
 if os.path.exists("sh2_cartesian.pt"):
     SH2_TO_CARTESIAN = torch.load("sh2_cartesian.pt")
 else:
-    SH2_TO_CARTESIAN = fit_sh2_to_cartesian()
+    SH2_TO_CARTESIAN = fit_sh_to_cartesian(2, _cartesian_quadrupole)
     torch.save(SH2_TO_CARTESIAN, "sh2_cartesian.pt")
 
 class IrrepLinear(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.weight = nn.Linear(channels, channels)
+        self.weight = nn.Linear(channels, channels, bias=False)
 
     def forward(self, x):
         # x: [N,C,m]
@@ -84,16 +78,30 @@ class IrrepLinear(nn.Module):
 class EquivariantReadout(nn.Module):
     def __init__(self, C: int, hidden: int = 64):
         super().__init__()
-        self.ll = nn.Sequential(
-            nn.Linear(C, hidden),
+        self.proj = nn.Linear(C, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(-1, -2)     
+        x = self.proj(x)             
+        return x.squeeze(-1)        
+
+
+class EquivariantNormReadout(nn.Module):
+    def __init__(self, C: int, hidden: int = 64, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.equiv_proj = nn.Linear(C, hidden, bias=False)   
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden, hidden),
             nn.SiLU(),
             nn.Linear(hidden, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(-1, -2)   
-        x = self.ll(x)          
-        return x.squeeze(-1)   
+        v = self.equiv_proj(x.transpose(-1, -2))              
+        v = v.transpose(-1, -2)                               
+        norms = torch.sqrt((v ** 2).sum(dim=-1) + self.eps)  
+        return self.mlp(norms).squeeze(-1)                    
 
 def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
     """Return the CG matrix for a single J from the cached dict."""
@@ -506,7 +514,7 @@ class SE3InterNeighborhoodLayer(nn.Module):
             for k in range(max_degree + 1):
                 key = f"{l}_{k}"
                 self.msg_to_phi[key] = nn.ModuleDict({
-                    str(J): EquivariantReadout(feature_dim)
+                    str(J): EquivariantNormReadout(feature_dim)
                     for J in range(abs(l - k), l + k + 1)
                 })
 
@@ -725,7 +733,7 @@ class SE3IntraOnlyLayer(nn.Module):
         self.intra_attn = IntraNeighborhoodAttention(radial_net, max_degree, feature_dim, hidden_dim)
  
         self.W_V_self_intra = nn.ModuleDict({
-            str(l): nn.Linear(2 * l + 1, 2 * l + 1, bias=False)
+            str(l): IrrepLinear(feature_dim)
             for l in range(max_degree + 1)
         })
  

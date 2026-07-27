@@ -37,51 +37,81 @@ from src.se3_crossformer.spherical_harm import (
 
 from src.se3_crossformer.bessel_gpu import BesselTable
 
-# ---------------------------------------------------------------------------
-# Clebsch-Gordan matrices (unchanged)
-# ---------------------------------------------------------------------------
-
+from e3nn import o3
 _CG_CACHE: Dict[Tuple[int, int], Dict[int, torch.Tensor]] = {}
+_SH_BASIS_CHANGE_CACHE: Dict[int, torch.Tensor] = {}
+
+
+def _fit_sh_basis_change(l: int, n_samples: int = 20000, tol: float = 1e-4) -> torch.Tensor:
+    """
+    Fits the orthogonal change-of-basis matrix U_l relating e3nn's real
+    spherical harmonics to THIS codebase's get_spherical_harmonics, for the
+    same physical direction n:
+
+        get_spherical_harmonics(l, theta, phi)  ≈  e3nn_Y_l(n) @ U_l
+
+    Used ONLY inside clebsch_gordan_matrix, to translate e3nn's Wigner 3j
+    coefficients into get_spherical_harmonics' own convention. Nothing else
+    in the model calls e3nn or bypasses get_spherical_harmonics.
+    """
+    if l in _SH_BASIS_CHANGE_CACHE:
+        return _SH_BASIS_CHANGE_CACHE[l]
+
+    from .irr_rep import x_to_alpha_beta
+
+    n = torch.randn(n_samples, 3, dtype=torch.float64)
+    n = n / n.norm(dim=-1, keepdim=True)
+
+    alpha, beta = x_to_alpha_beta(n)
+    theta = math.pi - beta   # matches every existing call site exactly
+
+    Y_custom = get_spherical_harmonics(l, theta=theta, phi=alpha).to(torch.float64)                     # [N, 2l+1]
+    Y_e3nn   = o3.spherical_harmonics(l, n, normalize=True, normalization='component').to(torch.float64)  # [N, 2l+1]
+
+    U, *_ = torch.linalg.lstsq(Y_e3nn, Y_custom)   # Y_e3nn @ U ≈ Y_custom
+    resid = (Y_e3nn @ U - Y_custom).abs().max().item()
+    assert resid < tol, f"SH basis-change fit residual too high for l={l}: {resid:.2e}"
+
+    # Re-orthogonalize defensively (U should already be ~orthogonal since both
+    # bases are orthonormal) to avoid compounding lstsq drift into the CG conjugation.
+    Uo, _, Vt = torch.linalg.svd(U)
+    U = (Uo @ Vt).to(torch.float32)
+
+    _SH_BASIS_CHANGE_CACHE[l] = U
+    return U
 
 
 def clebsch_gordan_matrix(l: int, k: int) -> Dict[int, torch.Tensor]:
-    """Return {J: Q_J} Clebsch-Gordan matrices, cached after first call."""
+    """
+    Return {J: Q_J} matrices, Q_J: [(2l+1)(2k+1), 2J+1], cached after first call.
+
+    Computed via e3nn.o3.wigner_3j (correct for real, component-normalized
+    harmonics) then conjugated through the fitted basis-change matrices
+    U_l, U_k, U_J so the result correctly intertwines get_spherical_harmonics'
+    own convention. The previous sympy-based CG() implementation assumed the
+    complex Y_l^m convention, which does not match get_spherical_harmonics
+    and silently broke equivariance for any l,k >= 1.
+    """
     if (l, k) in _CG_CACHE:
         return _CG_CACHE[(l, k)]
 
-    try:
-        from sympy.physics.quantum.cg import CG
-        from sympy import Rational, N as sympy_N
-    except ImportError:
-        raise ImportError(
-            "sympy is required for Clebsch-Gordan computation.\n"
-            "Install with:  pip install sympy"
-        )
+    U_l = _fit_sh_basis_change(l).to(torch.float64)
+    U_k = _fit_sh_basis_change(k).to(torch.float64)
 
-    dim_out = (2 * l + 1) * (2 * k + 1)
     result: Dict[int, torch.Tensor] = {}
-
     for J in range(abs(l - k), l + k + 1):
-        dim_J = 2 * J + 1
-        Q_J   = torch.zeros(dim_out, dim_J, dtype=torch.float64)
+        U_J = _fit_sh_basis_change(J).to(torch.float64)
 
-        for m_l in range(-l, l + 1):
-            for m_k in range(-k, k + 1):
-                row = (m_l + l) * (2 * k + 1) + (m_k + k)
-                for M in range(-J, J + 1):
-                    col    = M + J
-                    cg_val = CG(
-                        Rational(l),  Rational(m_l),
-                        Rational(k),  Rational(m_k),
-                        Rational(J),  Rational(M),
-                    ).doit()
-                    Q_J[row, col] = float(sympy_N(cg_val))
+        w3j     = o3.wigner_3j(l, k, J).to(torch.float64)                  # [2l+1, 2k+1, 2J+1]
+        Q_e3nn  = w3j.reshape((2 * l + 1) * (2 * k + 1), 2 * J + 1)        # [(2l+1)(2k+1), 2J+1]
 
-        result[J] = Q_J.to(torch.float32)
+        K = torch.kron(U_l, U_k)                                          # [(2l+1)(2k+1), (2l+1)(2k+1)]
+        Q_custom_J = K.T @ Q_e3nn @ U_J
+
+        result[J] = Q_custom_J.to(torch.float32)
 
     _CG_CACHE[(l, k)] = result
     return result
-
 
 def precompute_cg_matrices(max_degree: int) -> None:
     for l in range(max_degree + 1):
@@ -171,9 +201,9 @@ class RadialNetworkSFB(nn.Module):
     def __init__(self, num_basis: int, hidden_dim: int = 32):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(num_basis, hidden_dim),
+            nn.Linear(num_basis, hidden_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1, bias=False),
         )
         self.num_basis = num_basis
  
@@ -244,9 +274,9 @@ class RadialNetworkGSFB(nn.Module):
         self.N_cheb             = table.N_cheb
  
         self.net = nn.Sequential(
-            nn.Linear(self.num_orders, hidden_dim),
+            nn.Linear(self.num_orders, hidden_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1, bias=False),
         )
  
     @classmethod
@@ -333,11 +363,11 @@ class RadialNetworkGRBF(nn.Module):
         # Cosine-envelope cutoff to enforce smoothness at cutoff_radius
         # f(r) = 0.5*(cos(pi*r/cutoff)+1) for r < cutoff, else 0
         self.net = nn.Sequential(
-            nn.Linear(num_basis, hidden_dim),
+            nn.Linear(num_basis, hidden_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1, bias=False),
         )
 
     def _basis(self, r: torch.Tensor) -> torch.Tensor:
