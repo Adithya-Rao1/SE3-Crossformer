@@ -1,3 +1,19 @@
+"""
+QM9 target indices (0-based, following torch_geometric convention):
+    0:  mu      (dipole moment, D)
+    1:  alpha   (isotropic polarizability, a0^3)
+    2:  homo    (HOMO energy, eV)
+    3:  lumo    (LUMO energy, eV)
+    4:  gap     (HOMO-LUMO gap, eV)
+    5:  R2      (electronic spatial extent, a0^2)
+    6:  zpve    (zero-point vibrational energy, eV)
+    7:  U0      (internal energy at 0K, eV)
+    8:  U       (internal energy at 298K, eV)
+    9:  H       (enthalpy at 298K, eV)
+    10: G       (free energy at 298K, eV)
+    11: Cv      (heat capacity at 298K, cal/mol/K)
+"""
+
 import argparse
 import math
 import os
@@ -11,9 +27,12 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from scipy import stats
 
-from src.train import load_qm9, _filter_small_graphs
-from src.tests.pred_se3_orig import SE3RegressionWrapper, batch_to_dense
+from src.qm9_tests.train import load_qm9, _filter_small_graphs
+from src.qm9_tests.pred_se3_orig import SE3RegressionWrapper, batch_to_dense
 from src.training_monitor import SystemMonitor
+
+# alpha, gap, homo, lumo, mu, and Cv
+target_indices = [1, 4, 3, 2, 0, 11]
 
 
 def confidence_interval_95(values):
@@ -28,7 +47,7 @@ def confidence_interval_95(values):
     return mean, half_width
 
 
-def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
+def train_epoch(target_idx, model, loader, optimizer, device, min_nodes, accum_steps=1,
                  empty_cache_every=1, monitor: SystemMonitor = None):
     model.train()
     total_loss = 0.0
@@ -40,7 +59,7 @@ def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
 
     for i, batch in enumerate(loader):
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, min_nodes, device)
+        tensors = _filter_small_graphs(target_idx, batch, min_nodes, device)
         if tensors is None:
             continue
         _, _, _, _, target, graph_batch = tensors
@@ -53,7 +72,7 @@ def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
             pred = model(atoms, coors, mask, edges)
             if pred.shape[0] != target.shape[0]:
                             continue
-            loss = nn.functional.l1_loss(pred, target) / accum_steps
+            loss = nn.functional.l1_loss(pred.squeeze, target) / accum_steps
             loss.backward()
         except torch.cuda.OutOfMemoryError:
             n_atoms = atoms.shape[1] if atoms is not None else "?"
@@ -107,7 +126,7 @@ def train_epoch(model, loader, optimizer, device, min_nodes, accum_steps=1,
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, min_nodes, empty_cache_every=1):
+def evaluate(target_idx, model, loader, device, min_nodes, empty_cache_every=1):
     model.eval()
     total_mae = 0.0
     n_graphs = 0
@@ -115,7 +134,7 @@ def evaluate(model, loader, device, min_nodes, empty_cache_every=1):
 
     for i, batch in enumerate(loader):
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, min_nodes, device)
+        tensors = _filter_small_graphs(target_idx, batch, min_nodes, device)
         if tensors is None:
             continue
         _, _, _, _, target, graph_batch = tensors
@@ -156,6 +175,8 @@ def evaluate(model, loader, device, min_nodes, empty_cache_every=1):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=int, default=1)
+    parser.add_argument("--target_indices", type=list, default=target_indices,
+                         help="Target indices for multiple runs")
     parser.add_argument("--min_nodes", type=int, default=4,
                          help="Drop graphs with fewer atoms than this. Set equal to "
                               "the custom model's --num_parts to evaluate both models "
@@ -211,7 +232,7 @@ def main():
     print(f"Effective batch:  {effective_batch}")
 
     train_loader, val_loader, test_loader = load_qm9(
-        args.target, args.batch_size, args.data_root, args.device
+        args.batch_size, args.data_root, args.device
     )
 
     trial_maes = []
@@ -236,12 +257,12 @@ def main():
         for epoch in range(args.epochs):
             print(f"[Epoch {epoch + 1}]")
             train_loss = train_epoch(
-                model, train_loader, optimizer, device, args.min_nodes,
+                args.target, model, train_loader, optimizer, device, args.min_nodes,
                 accum_steps=args.accum_steps,
                 empty_cache_every=args.empty_cache_every,
                 monitor=monitor,
             )
-            val_mae = evaluate(model, val_loader, device, args.min_nodes,
+            val_mae = evaluate(args.target, model, val_loader, device, args.min_nodes,
                                 empty_cache_every=args.empty_cache_every)
             scheduler.step()
 
@@ -260,7 +281,7 @@ def main():
         )
 
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        test_mae = evaluate(model, test_loader, device, args.min_nodes,
+        test_mae = evaluate(args.target, model, test_loader, device, args.min_nodes,
                              empty_cache_every=args.empty_cache_every)
         print(f"  Trial {trial + 1} test MAE: {test_mae:.4f}")
         trial_maes.append(test_mae)
