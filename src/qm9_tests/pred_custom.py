@@ -10,7 +10,7 @@ from scipy import stats
 
 from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
 from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB
-from src.train import load_qm9, _filter_small_graphs, ATOM_TYPES
+from src.qm9_tests.train import load_qm9, _filter_small_graphs, ATOM_TYPES
 
 
 def confidence_interval_95(values):

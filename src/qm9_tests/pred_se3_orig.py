@@ -10,9 +10,9 @@ import torch.nn as nn
 from scipy import stats
 from torch_geometric.utils import to_dense_batch, to_dense_adj
 
-from se3_transformer_pytorch import SE3Transformer
+from src.qm9_tests.se3_transformer_pytorch.se3_transformer_pytorch import SE3Transformer
 
-from src.train import load_qm9, _filter_small_graphs
+from src.qm9_tests.train import load_qm9, _filter_small_graphs
 
 ATOM_VOCAB = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}
 NUM_TOKENS = len(ATOM_VOCAB)
@@ -47,7 +47,7 @@ class SE3RegressionWrapper(nn.Module):
             edge_dim=16,
             reduce_dim_out=True,
         )
-        self.readout = nn.Linear(1, 19)
+        self.readout = nn.Linear(1, 1)
 
     def forward(self, atoms, coors, mask, edges):
         per_atom = self.backbone(atoms, coors, mask, edges=edges, return_type=0)

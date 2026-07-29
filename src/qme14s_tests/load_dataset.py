@@ -50,11 +50,11 @@ def read_hdf5_files(num_files):
                 data_list.append(data)
     return data_list
 
-# Read all files
+"""# Read all files
 num_files = 6  # Set based on the actual number of files
 data_list = read_hdf5_files(num_files)
 
-print(f"Loaded {len(data_list)} Data objects.")
+print(f"Loaded {len(data_list)} Data objects.")"""
 
 # qme14_single_point.h5
 def read_hdf5_file(filename):
@@ -136,10 +136,10 @@ def read_hdf5_file(filename):
                 
     return data_list
 
-filename = 'QMe14S_single_point.h5'  # HDF5 filename
+"""filename = 'QMe14S_single_point.h5'  # HDF5 filename
 data_list = read_hdf5_file(filename)
 
-print(f"Successfully loaded {len(data_list)} Data objects.")
+print(f"Successfully loaded {len(data_list)} Data objects.")"""
 
 
 # opt_186102.h5
@@ -223,7 +223,7 @@ def read_hdf5_file(filename):
     return data_list
 
 # Use the read function
-filename = 'OPT_186102.h5'  # HDF5 filename
+filename = '/home/ubuntu/se3-crossformer-data/qme14s_data/OPT_186102.h5'  # HDF5 filename
 data_list = read_hdf5_file(filename)
 
 print(f"Successfully loaded {len(data_list)} Data objects.")
@@ -265,11 +265,11 @@ def read_hdf5_file(filename):
                 
     return data_list
 
-# Use the read function
+"""# Use the read function
 filename = 'Hessian_opt.h5'  # HDF5 filename
 data_list = read_hdf5_file(filename)
 
-print(f"Successfully loaded {len(data_list)} Data objects.")
+print(f"Successfully loaded {len(data_list)} Data objects.")"""
 
 
 # Hessian_single_point.h5
@@ -312,11 +312,11 @@ def read_hessian_hdf5_file(filename):
                 
     return data_list
 
-# Use the read function
+"""# Use the read function
 filename = 'Hessian_single_point.h5'  # HDF5 filename
 data_list = read_hessian_hdf5_file(filename)
 
-print(f"Successfully loaded {len(data_list)} Data objects.")
+print(f"Successfully loaded {len(data_list)} Data objects.")"""
 
 
 # nmr.h5
@@ -363,8 +363,8 @@ def read_nmr_hdf5_file(filename):
                 
     return data_list
 
-# Use the read function
+""" Use the read function
 filename = 'nmr.h5'  # HDF5 filename
 data_list = read_nmr_hdf5_file(filename)
 
-print(f"Successfully loaded {len(data_list)} Data objects.")
+print(f"Successfully loaded {len(data_list)} Data objects.")"""
