@@ -6,8 +6,8 @@ from math import pi
 from pathlib import Path
 from functools import wraps
 
-from se3_transformer_pytorch.utils import exists, default, cast_torch_tensor, to_order
-from se3_transformer_pytorch.spherical_harmonics import get_spherical_harmonics, clear_spherical_harmonics_cache
+from src.qm9_tests.se3_transformer_pytorch.utils import exists, default, cast_torch_tensor, to_order
+from src.qm9_tests.se3_transformer_pytorch.spherical_harmonics import get_spherical_harmonics, clear_spherical_harmonics_cache
 
 DATA_PATH = path = Path(os.path.dirname(__file__)) / 'data'
 

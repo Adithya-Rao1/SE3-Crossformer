@@ -6,10 +6,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 
-from se3_transformer_pytorch.basis import get_basis
-from se3_transformer_pytorch.utils import exists, default, uniq, map_values, batched_index_select, masked_mean, to_order, fourier_encode, cast_tuple, safe_cat, fast_split, rand_uniform, broadcat
-from se3_transformer_pytorch.reversible import ReversibleSequence, SequentialSequence
-from se3_transformer_pytorch.rotary import SinusoidalEmbeddings, apply_rotary_pos_emb
+from src.qm9_tests.se3_transformer_pytorch.basis import get_basis
+from src.qm9_tests.se3_transformer_pytorch.utils import exists, default, uniq, map_values, batched_index_select, masked_mean, to_order, fourier_encode, cast_tuple, safe_cat, fast_split, rand_uniform, broadcat
+from src.qm9_tests.se3_transformer_pytorch.reversible import ReversibleSequence, SequentialSequence
+from src.qm9_tests.se3_transformer_pytorch.rotary import SinusoidalEmbeddings, apply_rotary_pos_emb
 
 from einops import rearrange, repeat
 

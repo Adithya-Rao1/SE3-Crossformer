@@ -11,6 +11,7 @@ from scipy import stats
 from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
 from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB
 from src.qm9_tests.train import load_qm9, _filter_small_graphs, ATOM_TYPES
+from src.qm9_tests.dummy_data import load_qm9_dummy
 
 
 def confidence_interval_95(values):
@@ -48,7 +49,7 @@ def build_model(args, device):
 
 
 @torch.no_grad()
-def predict_and_record(model, loader, num_parts, device, out_csv):
+def predict_and_record(model, loader, target_idx, num_parts, device, out_csv):
     model.eval()
     rows = []
     total_abs_err = 0.0
@@ -57,7 +58,7 @@ def predict_and_record(model, loader, num_parts, device, out_csv):
 
     for batch in loader:
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts, device)
+        tensors = _filter_small_graphs(target_idx, batch, num_parts, device)
         if tensors is None:
             continue
         node_feat, pos, edge_index, atomic_mass, target, graph_batch = tensors
@@ -106,12 +107,22 @@ def main():
     parser.add_argument("--out_dir", type=str, default="./predictions_custom")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dummy_data", action="store_true",
+                         help="Use synthetic in-memory molecules instead of load_qm9, "
+                              "for smoke-testing against dummy checkpoints without real QM9 data.")
+    parser.add_argument("--dummy_batches", type=int, default=6,
+                         help="Number of test batches to synthesize when --dummy_data is set.")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    _, _, test_loader = load_qm9(args.target, args.batch_size, args.data_root, args.device)
+    if args.dummy_data:
+        _, _, test_loader = load_qm9_dummy(
+            args.batch_size, args.data_root, args.device, num_batches=args.dummy_batches
+        )
+    else:
+        _, _, test_loader = load_qm9(args.batch_size, args.data_root, args.device)
 
     trial_maes = []
     for trial in range(args.trials):
@@ -127,7 +138,7 @@ def main():
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
         out_csv = os.path.join(args.out_dir, f"predictions_trial{trial}.csv")
-        mae = predict_and_record(model, test_loader, args.num_parts, device, out_csv)
+        mae = predict_and_record(model, test_loader, args.target, args.num_parts, device, out_csv)
         print(f"[trial {trial}] test MAE: {mae:.4f}  (predictions -> {out_csv})")
         trial_maes.append(mae)
 

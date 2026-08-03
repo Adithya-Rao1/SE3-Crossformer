@@ -29,6 +29,7 @@ from scipy import stats
 
 from src.qm9_tests.train import load_qm9, _filter_small_graphs
 from src.qm9_tests.pred_se3_orig import SE3RegressionWrapper, batch_to_dense
+from src.qm9_tests.dummy_data import load_qm9_dummy
 from src.training_monitor import SystemMonitor
 
 # alpha, gap, homo, lumo, mu, and Cv
@@ -47,7 +48,7 @@ def confidence_interval_95(values):
     return mean, half_width
 
 
-def train_epoch(target_idx, model, loader, optimizer, device, min_nodes, accum_steps=1,
+def train_epoch(target_idx, model, loader, optimizer, device, min_nodes, epoch, accum_steps=1,
                  empty_cache_every=1, monitor: SystemMonitor = None):
     model.train()
     total_loss = 0.0
@@ -72,7 +73,7 @@ def train_epoch(target_idx, model, loader, optimizer, device, min_nodes, accum_s
             pred = model(atoms, coors, mask, edges)
             if pred.shape[0] != target.shape[0]:
                             continue
-            loss = nn.functional.l1_loss(pred.squeeze, target) / accum_steps
+            loss = nn.functional.l1_loss(pred.squeeze(), target) / accum_steps
             loss.backward()
         except torch.cuda.OutOfMemoryError:
             n_atoms = atoms.shape[1] if atoms is not None else "?"
@@ -98,11 +99,12 @@ def train_epoch(target_idx, model, loader, optimizer, device, min_nodes, accum_s
 
         step_idx = i + 1
         if step_idx % accum_steps == 0:
+            if monitor is not None:
+                monitor.record_grad_stats(model)
             optimizer.step()
             optimizer.zero_grad()
-            print(f"Batch {step_idx} | accum MAE: {accum_loss.item():.4f}")
             if monitor is not None:
-                monitor.commit(step_idx, accum_loss.item())
+                monitor.commit(accum_loss.item())
             accum_loss = torch.tensor(0.0, device=device)
             if (step_idx // accum_steps) % empty_cache_every == 0:
                 torch.cuda.empty_cache()
@@ -112,21 +114,24 @@ def train_epoch(target_idx, model, loader, optimizer, device, min_nodes, accum_s
 
     remainder = len(loader) % accum_steps
     if remainder != 0:
+        if monitor is not None:
+            monitor.record_grad_stats(model)
         optimizer.step()
         optimizer.zero_grad()
         torch.cuda.empty_cache()
         print(f"Flushed {remainder} remaining micro-batch(es).")
         if monitor is not None:
-            monitor.commit(len(loader), accum_loss.item())
+            monitor.commit(accum_loss.item())
 
     if skipped:
         print(f"[epoch summary] skipped {skipped} batch(es) due to OOM.")
 
+    print(f"Epoch: {epoch + 1} | Epoch MAE: {total_loss/max(n_graphs, 1):.4f}")
     return total_loss / max(n_graphs, 1)
 
 
 @torch.no_grad()
-def evaluate(target_idx, model, loader, device, min_nodes, empty_cache_every=1):
+def evaluate(target_idx, model, loader, device, min_nodes, empty_cache_every=1, epoch=None):
     model.eval()
     total_mae = 0.0
     n_graphs = 0
@@ -147,7 +152,7 @@ def evaluate(target_idx, model, loader, device, min_nodes, empty_cache_every=1):
             pred = model(atoms, coors, mask, edges)
             if pred.shape[0] != target.shape[0]:
                 continue
-            mae = nn.functional.l1_loss(pred, target).item()
+            mae = nn.functional.l1_loss(pred.squeeze(), target).item()
         except torch.cuda.OutOfMemoryError:
             n_atoms = atoms.shape[1] if atoms is not None else "?"
             print(f"[OOM] skipping eval batch {i + 1} (N={n_atoms}, "
@@ -168,6 +173,11 @@ def evaluate(target_idx, model, loader, device, min_nodes, empty_cache_every=1):
 
     if skipped:
         print(f"[eval summary] skipped {skipped} batch(es) due to OOM.")
+
+    if epoch:
+        print(f"Epoch: {epoch + 1} | Epoch Eval MAE: {total_mae/max(n_graphs, 1):.4f}")
+    else:
+        print(f"Eval MAE: {total_mae / max(n_graphs, 1):.4f}")
 
     return total_mae / max(n_graphs, 1)
 
@@ -207,6 +217,9 @@ def main():
     parser.add_argument("--dim_head", type=int, default=16)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min_lr", type=float, default=1e-4,
+                         help="Floor of the single-cycle cosine LR decay "
+                              "(CosineAnnealingLR eta_min).")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--data_root", type=str,
@@ -219,6 +232,12 @@ def main():
                               "utilization CSVs and plots.")
     parser.add_argument("--device", type=str,
                          default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dummy_data", action="store_true",
+                         help="Use synthetic in-memory molecules instead of load_qm9, "
+                              "for smoke-testing the pipeline without real QM9 data on disk.")
+    parser.add_argument("--dummy_batches", type=int, default=6,
+                         help="Number of training batches to synthesize when --dummy_data "
+                              "is set (val/test get roughly a third of this each).")
     args = parser.parse_args()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -231,9 +250,14 @@ def main():
     print(f"Accum steps:      {args.accum_steps}")
     print(f"Effective batch:  {effective_batch}")
 
-    train_loader, val_loader, test_loader = load_qm9(
-        args.batch_size, args.data_root, args.device
-    )
+    if args.dummy_data:
+        train_loader, val_loader, test_loader = load_qm9_dummy(
+            args.batch_size, args.data_root, args.device, num_batches=args.dummy_batches
+        )
+    else:
+        train_loader, val_loader, test_loader = load_qm9(
+            args.batch_size, args.data_root, args.device
+        )
 
     trial_maes = []
     for trial in range(args.trials):
@@ -246,7 +270,7 @@ def main():
         ).to(device)
 
         optimizer = Adam(model.parameters(), lr=args.lr)
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
         monitor = SystemMonitor(device)
 
         ckpt_path = os.path.join(
@@ -257,18 +281,18 @@ def main():
         for epoch in range(args.epochs):
             print(f"[Epoch {epoch + 1}]")
             train_loss = train_epoch(
-                args.target, model, train_loader, optimizer, device, args.min_nodes,
+                args.target, model, train_loader, optimizer, device, args.min_nodes, epoch,
                 accum_steps=args.accum_steps,
                 empty_cache_every=args.empty_cache_every,
                 monitor=monitor,
             )
             val_mae = evaluate(args.target, model, val_loader, device, args.min_nodes,
-                                empty_cache_every=args.empty_cache_every)
+                                empty_cache_every=args.empty_cache_every, epoch=epoch)
             scheduler.step()
 
             if val_mae < best_val_mae:
                 best_val_mae = val_mae
-                print(f"  [New best] val MAE: {val_mae:.4f} -- saving checkpoint.")
+                print(f"  [New best] val MAE: {val_mae:.4f} — saving checkpoint.")
                 torch.save(model.state_dict(), ckpt_path)
 
             if epoch % 10 == 0:
@@ -287,7 +311,7 @@ def main():
         trial_maes.append(test_mae)
 
     mean_mae, half_width = confidence_interval_95(trial_maes)
-    print(f"\nTest MAE over {args.trials} trials: {mean_mae:.4f} +/- {half_width:.4f}  (95% CI)")
+    print(f"\nTest MAE over {args.trials} trials: {mean_mae:.4f} ± {half_width:.4f}  (95% CI)")
 
 
 if __name__ == "__main__":

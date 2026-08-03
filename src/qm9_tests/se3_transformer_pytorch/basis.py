@@ -6,9 +6,9 @@ from einops import rearrange
 from itertools import product
 from contextlib import contextmanager
 
-from se3_transformer_pytorch.irr_repr import irr_repr, spherical_harmonics
-from se3_transformer_pytorch.utils import torch_default_dtype, cache_dir, exists, default, to_order
-from se3_transformer_pytorch.spherical_harmonics import clear_spherical_harmonics_cache
+from src.qm9_tests.se3_transformer_pytorch.irr_repr import irr_repr, spherical_harmonics
+from src.qm9_tests.se3_transformer_pytorch.utils import torch_default_dtype, cache_dir, exists, default, to_order
+from src.qm9_tests.se3_transformer_pytorch.spherical_harmonics import clear_spherical_harmonics_cache
 
 # constants
 
