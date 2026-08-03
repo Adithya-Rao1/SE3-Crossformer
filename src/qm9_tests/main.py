@@ -36,6 +36,8 @@ def train_se3_cross(target, args, dry_run):
         "--metrics_dir", out_dir,
         "--device", args.device,
     ]
+    if args.dummy_data:
+        cmd += ["--dummy_data", "--dummy_batches", str(args.dummy_batches)]
     run(cmd, dry_run)
     return out_dir
 
@@ -60,6 +62,8 @@ def train_se3_trans(target, args, dry_run):
         "--metrics_dir", out_dir,
         "--device", args.device,
     ]
+    if args.dummy_data:
+        cmd += ["--dummy_data", "--dummy_batches", str(args.dummy_batches)]
     run(cmd, dry_run)
     return out_dir
 
@@ -75,20 +79,27 @@ def main():
     parser.add_argument("--trials", type=int, default=5,
                          help="Number of trials (checkpoints) per (model, target). "
                               "Keep at 5 to match the 95%% CI sample size used downstream.")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--num_parts", type=int, default=4,
                          help="Passed as --num_parts to the se3_cross model and --min_nodes "
                               "to the se3_trans model, so both are trained/evaluated on the "
                               "same set of molecules.")
     parser.add_argument("--se3_cross_batch_size", type=int, default=32)
     parser.add_argument("--se3_cross_accum_steps", type=int, default=8)
-    parser.add_argument("--se3_trans_batch_size", type=int, default=8)
-    parser.add_argument("--se3_trans_accum_steps", type=int, default=32)
+    parser.add_argument("--se3_trans_batch_size", type=int, default=32)
+    parser.add_argument("--se3_trans_accum_steps", type=int, default=8)
     parser.add_argument("--data_root", type=str, default="/home/ubuntu/se3-crossformer-data/data")
-    parser.add_argument("--out_root", type=str, default="./checkpoints")
+    parser.add_argument("--out_root", type=str, default="./qm9_checkpoints")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dry_run", action="store_true",
                          help="Print the commands without running them.")
+    parser.add_argument("--dummy_data", action="store_true",
+                         help="Use synthetic in-memory molecules instead of load_qm9 in "
+                              "both training scripts, for smoke-testing the whole pipeline "
+                              "without real QM9 data on disk.")
+    parser.add_argument("--dummy_batches", type=int, default=6,
+                         help="Number of training batches to synthesize when --dummy_data "
+                              "is set (val/test get roughly a third of this each).")
     args = parser.parse_args()
 
     print(f"Targets:  {args.targets}  ({[TARGET_NAMES.get(t, '?') for t in args.targets]})")

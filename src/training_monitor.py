@@ -86,8 +86,13 @@ class SystemMonitor:
         self._gpu_buf = []
         self._cpu_buf = []
         self._mem_buf = []
+        self._grad_norm = float("nan")
+        self._weight_norm = float("nan")
+        self._grad_weight_ratio = float("nan")
+        self._step_counter = 0
         self.history = {
             "step": [], "loss": [], "gpu_util": [], "cpu_util": [], "mem_util": [],
+            "grad_norm": [], "weight_norm": [], "grad_weight_ratio": [],
         }
         psutil.cpu_percent(interval=None)
 
@@ -96,31 +101,54 @@ class SystemMonitor:
         self._cpu_buf.append(get_cpu_utilization())
         self._mem_buf.append(get_memory_utilization())
 
-    def commit(self, step_idx, loss_value):
+    def record_grad_stats(self, model):
+        grad_norms = [p.grad.detach().norm(2) for p in model.parameters() if p.grad is not None]
+        weight_norms = [p.detach().norm(2) for p in model.parameters()]
+
+        grad_norm = float(torch.norm(torch.stack(grad_norms), 2)) if grad_norms else 0.0
+        weight_norm = float(torch.norm(torch.stack(weight_norms), 2)) if weight_norms else 0.0
+
+        self._grad_norm = grad_norm
+        self._weight_norm = weight_norm
+        self._grad_weight_ratio = grad_norm / (weight_norm + 1e-18)
+
+    def commit(self, loss_value):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Mean of empty slice")
             gpu_mean = float(np.nanmean(self._gpu_buf)) if self._gpu_buf else float("nan")
         cpu_mean = float(np.mean(self._cpu_buf)) if self._cpu_buf else float("nan")
         mem_mean = float(np.mean(self._mem_buf)) if self._mem_buf else float("nan")
 
-        self.history["step"].append(step_idx)
+        self._step_counter += 1
+        self.history["step"].append(self._step_counter)
         self.history["loss"].append(float(loss_value))
         self.history["gpu_util"].append(gpu_mean)
         self.history["cpu_util"].append(cpu_mean)
         self.history["mem_util"].append(mem_mean)
+        self.history["grad_norm"].append(self._grad_norm)
+        self.history["weight_norm"].append(self._weight_norm)
+        self.history["grad_weight_ratio"].append(self._grad_weight_ratio)
 
         self._gpu_buf.clear()
         self._cpu_buf.clear()
         self._mem_buf.clear()
+        self._grad_norm = float("nan")
+        self._weight_norm = float("nan")
+        self._grad_weight_ratio = float("nan")
 
     def save_csv(self, out_path):
         import csv
         with open(out_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "loss", "gpu_util_pct", "cpu_util_pct", "mem_util_pct"])
+            writer.writerow([
+                "step", "loss", "gpu_util_pct", "cpu_util_pct", "mem_util_pct",
+                "grad_norm", "weight_norm", "grad_weight_ratio",
+            ])
             for row in zip(
                 self.history["step"], self.history["loss"], self.history["gpu_util"],
                 self.history["cpu_util"], self.history["mem_util"],
+                self.history["grad_norm"], self.history["weight_norm"],
+                self.history["grad_weight_ratio"],
             ):
                 writer.writerow(row)
 
@@ -133,16 +161,18 @@ class SystemMonitor:
             return
 
         steps = self.history["step"]
-        fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+        fig, axes = plt.subplots(2, 3, figsize=(16, 7))
         panels = [
             ("loss", "Loss (MAE)", axes[0, 0]),
             ("gpu_util", "GPU Utilization (%)", axes[0, 1]),
-            ("cpu_util", "CPU Utilization (%)", axes[1, 0]),
-            ("mem_util", "System Memory Utilization (%)", axes[1, 1]),
+            ("cpu_util", "CPU Utilization (%)", axes[0, 2]),
+            ("mem_util", "System Memory Utilization (%)", axes[1, 0]),
+            ("grad_norm", "Gradient Norm (L2)", axes[1, 1]),
+            ("grad_weight_ratio", "Grad Norm / Weight Norm", axes[1, 2]),
         ]
         for key, ylabel, ax in panels:
             ax.plot(steps, self.history[key], linewidth=1.2)
-            ax.set_xlabel("Accumulated batch step")
+            ax.set_xlabel("Optimizer step")
             ax.set_ylabel(ylabel)
             ax.set_title(ylabel)
             ax.grid(alpha=0.3)

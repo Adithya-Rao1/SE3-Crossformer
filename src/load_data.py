@@ -15,6 +15,14 @@ from rdkit import Chem
 from tqdm import tqdm
 from torch_geometric.data import Data, InMemoryDataset
 
+HAR2EV = 27.211386246
+KCALMOL2EV = 0.04336414
+
+QM9_TARGET_CONVERSION = torch.tensor([
+    1., 1., HAR2EV, HAR2EV, HAR2EV, 1., HAR2EV, HAR2EV, HAR2EV, HAR2EV,
+    HAR2EV, 1., KCALMOL2EV, KCALMOL2EV, KCALMOL2EV, KCALMOL2EV,
+])
+
 class CustomQM9Dataset(InMemoryDataset):
     def __init__(
         self,
@@ -55,6 +63,7 @@ class CustomQM9Dataset(InMemoryDataset):
     def process(self):
 
         df = pd.read_csv(self.csv_file)
+        target_matrix = df.iloc[:, 4:].to_numpy(dtype=float)
 
         suppl = Chem.SDMolSupplier(
             self.sdf_file,
@@ -64,25 +73,23 @@ class CustomQM9Dataset(InMemoryDataset):
 
         data_list = []
 
-        valid_rows = []
+        valid_mols = [
+            (row_idx, mol)
+            for row_idx, mol in enumerate(suppl)
+            if mol is not None
+        ]
 
-        for mol in suppl:
-            if mol is not None:
-                valid_rows.append(mol)
-
-        if len(valid_rows) != len(df):
+        if len(valid_mols) != len(df):
             print(
                 f"Warning: {len(df)} csv rows "
-                f"but {len(valid_rows)} valid molecules."
+                f"but {len(valid_mols)} valid molecules."
             )
 
-        for idx, (mol, row) in enumerate(
-            tqdm(
-                zip(valid_rows, df.itertuples(index=False)),
-                total=min(len(valid_rows), len(df)),
-                desc="Processing QM9"
-            )
+        for idx, (row_idx, mol) in enumerate(
+            tqdm(valid_mols, desc="Processing QM9")
         ):
+            if row_idx >= len(target_matrix):
+                continue
 
             atom_features = []
 
@@ -145,16 +152,11 @@ class CustomQM9Dataset(InMemoryDataset):
             if pos.shape[0] != x.shape[0]:
                 continue
 
-            target_values = [
-                float(v)
-                for v in row[1:]
-            ]
-
             y = torch.tensor(
-                target_values,
+                target_matrix[row_idx],
                 dtype=torch.float,
                 device=self.device
-            ).reshape(1, -1)
+            ).reshape(1, -1) * QM9_TARGET_CONVERSION.to(self.device)
 
             data = Data(
                 x=x,

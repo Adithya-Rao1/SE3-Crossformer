@@ -1,1 +1,1 @@
-from src.qm9_testsse3_transformer_pytorch.se3_transformer_pytorch import SE3Transformer
+from src.qm9_tests.se3_transformer_pytorch.se3_transformer_pytorch import SE3Transformer

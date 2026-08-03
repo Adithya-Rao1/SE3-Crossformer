@@ -4,7 +4,7 @@ from operator import mul
 import torch
 
 from functools import lru_cache
-from se3_transformer_pytorch.utils import cache
+from src.qm9_tests.se3_transformer_pytorch.utils import cache
 
 # constants
 

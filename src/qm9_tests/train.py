@@ -32,6 +32,7 @@ from src.se3_crossformer.model import SE3InterNeighborhoodTransformer, SE3IntraO
 from src.load_data import CustomQM9Dataset
 from src.training_monitor import SystemMonitor
 from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB, RadialNetworkSFB
+from src.qm9_tests.dummy_data import load_qm9_dummy
 
 ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
@@ -56,10 +57,11 @@ def load_qm9(batch_size=16, r: str = "./data", device=torch.device("cpu")):
 
     idx1 = 110000
     idx2 = 120000
+    idx3 = 130000
     perm = torch.randperm(len(dataset))
     train_dataset = dataset[perm[:idx1]]
     val_dataset   = dataset[perm[idx1:idx2]]
-    test_dataset  = dataset[perm[idx2:]]
+    test_dataset  = dataset[perm[idx2:idx3]]
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=2)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=2)
@@ -151,11 +153,13 @@ def train_epoch(target_idx, model, loader, optimizer, num_parts, device, accum_s
 
         step_idx = i + 1
         if step_idx % accum_steps == 0:
+            if monitor is not None:
+                monitor.record_grad_stats(model)
             optimizer.step()
             optimizer.zero_grad()
 
             if monitor is not None:
-                monitor.commit(step_idx, accum_loss.item())
+                monitor.commit(accum_loss.item())
             accum_loss = torch.tensor(0.0, device=device)
         else:
             print(f"Batch {step_idx} | micro-batch MAE: {loss.item() * accum_steps:.4f} "
@@ -163,11 +167,13 @@ def train_epoch(target_idx, model, loader, optimizer, num_parts, device, accum_s
 
     remainder = len(loader) % accum_steps
     if remainder != 0:
+        if monitor is not None:
+            monitor.record_grad_stats(model)
         optimizer.step()
         optimizer.zero_grad()
         print(f"Flushed {remainder} remaining micro-batch(es).")
         if monitor is not None:
-            monitor.commit(len(loader), accum_loss.item())
+            monitor.commit(accum_loss.item())
 
     print(f"Epoch: {epoch + 1} | Epoch MAE: {total_loss/max(n_graphs, 1):.4f}")
     return total_loss / max(n_graphs, 1)
@@ -191,7 +197,7 @@ def evaluate(target_idx, model, loader, num_parts, device, epoch=None):
             continue
 
         pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
-        mae  = nn.functional.l1_loss(pred, target).item()
+        mae  = nn.functional.l1_loss(pred.squeeze(-1), target).item()
         B    = pred.shape[0]
         total_mae += mae * B
         n_graphs  += B
@@ -215,23 +221,26 @@ def confidence_interval_95(values):
     return mean, half_width
 
 
-def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
+def main(partition_type="spectral", model_type="inter", rbf_type="gsfb"):
     parser = argparse.ArgumentParser()
     parser.add_argument("--target",      type=int,   default=1)
     parser.add_argument("--target_indices", type=list, default=target_indices, help="Target indices for multiple runs")
     parser.add_argument("--num_parts",   type=int,   default=4)
     parser.add_argument("--max_degree",  type=int,   default=2)
-    parser.add_argument("--batch_size",  type=int,   default=32)
-    parser.add_argument("--accum_steps", type=int,   default=8,
+    parser.add_argument("--batch_size",  type=int,   default=8)
+    parser.add_argument("--accum_steps", type=int,   default=4,
                         help="Gradient accumulation steps. "
                              "Effective batch = batch_size * accum_steps.")
     parser.add_argument("--partition_type", type=str, default="spectral")
     parser.add_argument("--model_type", type=str, default="inter")
-    parser.add_argument("--rbf_type", type=str, default="grbf")
+    parser.add_argument("--rbf_type", type=str, default="gsfb")
     parser.add_argument("--num_layers",  type=int,   default=4)
     parser.add_argument("--feature_dim", type=int,   default=32)
     parser.add_argument("--hidden_dim",  type=int,   default=64)
     parser.add_argument("--lr",          type=float, default=1e-3)
+    parser.add_argument("--min_lr",      type=float, default=1e-4,
+                        help="Floor of the single-cycle cosine LR decay "
+                             "(CosineAnnealingLR eta_min).")
     parser.add_argument("--epochs",      type=int,   default=10)
     parser.add_argument("--trials",      type=int,   default=1)
     parser.add_argument("--data_root",   type=str,   default="/home/ubuntu/se3-crossformer-data/data")
@@ -239,6 +248,12 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
                         help="Directory for per-trial loss/GPU/CPU/memory "
                              "utilization CSVs and plots.")
     parser.add_argument("--device",      type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dummy_data",  action="store_true",
+                        help="Use synthetic in-memory molecules instead of load_qm9, "
+                             "for smoke-testing the pipeline without real QM9 data on disk.")
+    parser.add_argument("--dummy_batches", type=int, default=6,
+                        help="Number of training batches to synthesize when --dummy_data "
+                             "is set (val/test get roughly a third of this each).")
     args = parser.parse_args()
 
     os.makedirs(args.metrics_dir, exist_ok=True)
@@ -251,9 +266,14 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
     print(f"Accum steps:      {args.accum_steps}")
     print(f"Effective batch:  {effective_batch}")
 
-    train_loader, val_loader, test_loader = load_qm9(
-        args.batch_size, args.data_root, args.device
-    )
+    if args.dummy_data:
+        train_loader, val_loader, test_loader = load_qm9_dummy(
+            args.batch_size, args.data_root, args.device, num_batches=args.dummy_batches
+        )
+    else:
+        train_loader, val_loader, test_loader = load_qm9(
+            args.batch_size, args.data_root, args.device
+        )
 
     trial_maes = []
     for trial in range(args.trials):
@@ -300,7 +320,7 @@ def main(partition_type="spectral", model_type="inter", rbf_type="grbf"):
             ).to(device)
 
         optimizer = Adam(model.parameters(), lr=args.lr)
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
         monitor = SystemMonitor(device)
 
         best_val_mae = float("inf")
