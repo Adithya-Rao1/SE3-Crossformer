@@ -41,17 +41,19 @@ def run_torch_profiler_experiment(
     RESULTS_DIR.mkdir(exist_ok=True)
     trace_path = str(RESULTS_DIR / f"{mode_label}_trace.json")
 
-    from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+    from src.se3_crossformer.model import SE3IntraOnlyTransformer
+    from src.se3_crossformer.se3_utils import RadialNetworkGRBF
 
-    model = SE3InterNeighborhoodTransformer(
+    model = SE3IntraOnlyTransformer(
+        radial_net  = RadialNetworkGRBF,
         in_features = len(ATOM_TYPES),
         max_degree  = args.max_degree,
-        num_layers  = args.num_layers,
         feature_dim = args.feature_dim,
         hidden_dim  = args.hidden_dim,
-        num_parts   = args.num_parts,
-        out_dim     = 19,
-        task        = "regression",
+        radius_cutoff = args.radius_cutoff,
+        scalar_out_dim = 1,
+        task        = 0,
+        bond_feature_dim  = getattr(args, "bond_feature_dim", 0),
     ).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -77,11 +79,14 @@ def run_torch_profiler_experiment(
         node_feat   = _one_hot_z(batch.x).to(device)
         pos         = batch.pos.to(device)
         edge_index  = batch.edge_index.to(device)
+        edge_attr   = batch.edge_attr.to(device)
         am          = _atomic_masses(batch.x).to(device)
-        target      = batch.y.to(device)
+        target      = batch.y[:, args.target].to(device)
         graph_batch = batch.batch.to(device)
+        graph_idx   = batch.idx.to(device)
 
-        pred = model(node_feat, pos, edge_index, am, graph_batch)
+        pred = model(node_feat, pos, edge_index, am, graph_batch,
+                     edge_attr=edge_attr, graph_idx=graph_idx)
         loss = nn.functional.l1_loss(pred.squeeze(-1), target)
         optimizer.zero_grad()
         loss.backward()

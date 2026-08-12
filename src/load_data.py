@@ -18,6 +18,13 @@ from torch_geometric.data import Data, InMemoryDataset
 HAR2EV = 27.211386246
 KCALMOL2EV = 0.04336414
 
+BOND_TYPES = [
+    Chem.BondType.SINGLE,
+    Chem.BondType.DOUBLE,
+    Chem.BondType.TRIPLE,
+    Chem.BondType.AROMATIC,
+]
+
 QM9_TARGET_CONVERSION = torch.tensor([
     1., 1., HAR2EV, HAR2EV, HAR2EV, 1., HAR2EV, HAR2EV, HAR2EV, HAR2EV,
     HAR2EV, 1., KCALMOL2EV, KCALMOL2EV, KCALMOL2EV, KCALMOL2EV,
@@ -114,16 +121,17 @@ class CustomQM9Dataset(InMemoryDataset):
                 i = bond.GetBeginAtomIdx()
                 j = bond.GetEndAtomIdx()
 
-                bond_order = float(
-                    bond.GetBondTypeAsDouble()
-                )
+                bond_type = bond.GetBondType()
+                bond_onehot = [
+                    1.0 if bond_type == t else 0.0 for t in BOND_TYPES
+                ]
 
                 rows.extend([i, j])
                 cols.extend([j, i])
 
                 edge_features.extend([
-                    [bond_order],
-                    [bond_order]
+                    bond_onehot,
+                    bond_onehot
                 ])
 
             if len(rows) == 0:
@@ -164,6 +172,7 @@ class CustomQM9Dataset(InMemoryDataset):
                 edge_attr=edge_attr,
                 pos=pos,
                 y=y,
+                idx=torch.tensor([idx]),
             )
 
             data_list.append(data)

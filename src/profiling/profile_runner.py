@@ -61,10 +61,10 @@ ALL_EXPERIMENTS = [
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--target",          type=int,   default=0)
-    p.add_argument("--num_parts",       type=int,   default=4)
+    p.add_argument("--radius_cutoff",   type=float, default=5.0)
     p.add_argument("--max_degree",      type=int,   default=2)
     p.add_argument("--batch_size",      type=int,   default=16)
-    p.add_argument("--num_layers",      type=int,   default=4)
+    p.add_argument("--bond_feature_dim", type=int,  default=4)
     p.add_argument("--feature_dim",     type=int,   default=32)
     p.add_argument("--hidden_dim",      type=int,   default=64)
     p.add_argument("--data_root",       type=str,   default="./data")
@@ -78,17 +78,19 @@ def parse_args():
 
 
 def build_model(args, device):
-    from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+    from src.se3_crossformer.model import SE3IntraOnlyTransformer
+    from src.se3_crossformer.se3_utils import RadialNetworkGRBF
     ATOM_TYPES = [1, 6, 7, 8, 9]
-    model = SE3InterNeighborhoodTransformer(
+    model = SE3IntraOnlyTransformer(
+        radial_net    = RadialNetworkGRBF,
         in_features   = len(ATOM_TYPES),
         max_degree    = args.max_degree,
-        num_layers    = args.num_layers,
         feature_dim   = args.feature_dim,
         hidden_dim    = args.hidden_dim,
-        num_parts     = args.num_parts,
-        out_dim       = 19,
-        task          = "regression",
+        radius_cutoff = args.radius_cutoff,
+        scalar_out_dim = 1,
+        task          = 0,
+        bond_feature_dim  = args.bond_feature_dim,
     ).to(device)
     return model
 
@@ -96,12 +98,11 @@ def build_model(args, device):
 def build_loaders(args):
     """Thin wrapper – reuse load_qm9 from train.py."""
     sys.path.insert(0, str(ROOT))
-    from train import load_qm9
+    from src.qm9_tests.train import load_qm9
     return load_qm9(
-        target_idx = args.target,
         batch_size = args.batch_size,
         r          = args.data_root,
-        device     = torch.device("cpu"),   
+        device     = torch.device("cpu"),
     )
 
 

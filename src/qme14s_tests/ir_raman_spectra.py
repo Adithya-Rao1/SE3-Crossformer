@@ -8,14 +8,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from inference_tensors import build_radius_graph, load_trained_model, predict_single
-from train_polarizability_dipole import get_atomic_masses
+from src.qme14s_tests.inference_tensors import load_trained_model, predict_single
+from src.qme14s_tests.train_qme14s import get_atomic_masses
 
 HARTREE_BOHR2_AMU_TO_CM1 = 5140.487  # sqrt(Hartree / (bohr^2 * amu)) in cm^-1
 
 def normal_modes_from_hessian(hessian, z, unit_factor=HARTREE_BOHR2_AMU_TO_CM1,
                                 n_zero_modes=None):
-    from train_polarizability_dipole import ATOMIC_MASSES
+    from src.qme14s_tests.train_qme14s import ATOMIC_MASSES
     n = len(z)
     masses = np.array([ATOMIC_MASSES.get(int(zi), 12.0) for zi in z])
     if n_zero_modes is None:
@@ -53,7 +53,7 @@ def raman_activity_from_invariants(dalpha_dQ):
     )
     return 45.0 * alpha_bar ** 2 + 7.0 * gamma2
 
-def raman_spectrum(pos, z, modes_cart, polar_model, device, delta=0.01, cutoff=5.0, num_parts=4):
+def raman_spectrum(pos, z, modes_cart, polar_model, device, delta=0.01):
     n = pos.shape[0]
     activities = []
     for k in range(modes_cart.shape[1]):
@@ -62,19 +62,16 @@ def raman_spectrum(pos, z, modes_cart, polar_model, device, delta=0.01, cutoff=5
         pos_plus = pos + delta * disp
         pos_minus = pos - delta * disp
 
-        pred_plus = predict_single(pos_plus, z, polar_model, None, device,
-                                     cutoff=cutoff, num_parts=num_parts)["polarizability"]
-        pred_minus = predict_single(pos_minus, z, polar_model, None, device,
-                                      cutoff=cutoff, num_parts=num_parts)["polarizability"]
+        pred_plus = predict_single(pos_plus, z, polar_model, None, device)["polarizability"]
+        pred_minus = predict_single(pos_minus, z, polar_model, None, device)["polarizability"]
 
         dalpha_dQ = (pred_plus - pred_minus) / (2.0 * delta)
         activities.append(raman_activity_from_invariants(dalpha_dQ))
     return np.array(activities)
 
-def ir_spectrum(pos, z, modes_cart, dedipole_model, device, cutoff=5.0, num_parts=4):
+def ir_spectrum(pos, z, modes_cart, dedipole_model, device):
     n = pos.shape[0]
-    pred = predict_single(pos, z, None, dedipole_model, device,
-                           cutoff=cutoff, num_parts=num_parts)["dipole_derivative"]  
+    pred = predict_single(pos, z, None, dedipole_model, device)["dipole_derivative"]
 
     intensities = []
     for k in range(modes_cart.shape[1]):
@@ -126,7 +123,6 @@ def plot_lsrl(ax, true, pred, title):
 
 def compute_predicted_spectra_for_molecule(hessian_h5, group_name, polar_model,
                                              dedipole_model, device, delta=0.01,
-                                             cutoff=5.0, num_parts=4,
                                              hessian_unit_factor=HARTREE_BOHR2_AMU_TO_CM1):
     with h5py.File(hessian_h5, "r") as f:
         group = f[group_name]
@@ -136,9 +132,9 @@ def compute_predicted_spectra_for_molecule(hessian_h5, group_name, polar_model,
 
     freqs_cm, modes_cart = normal_modes_from_hessian(hessian, z, unit_factor=hessian_unit_factor)
 
-    ir_int = (ir_spectrum(pos, z, modes_cart, dedipole_model, device, cutoff, num_parts)
+    ir_int = (ir_spectrum(pos, z, modes_cart, dedipole_model, device)
               if dedipole_model is not None else None)
-    raman_act = (raman_spectrum(pos, z, modes_cart, polar_model, device, delta, cutoff, num_parts)
+    raman_act = (raman_spectrum(pos, z, modes_cart, polar_model, device, delta)
                  if polar_model is not None else None)
 
     return freqs_cm, ir_int, raman_act
@@ -153,17 +149,13 @@ def main():
                          "adjust field names there to match your actual file.")
     p.add_argument("--polar_checkpoint", type=str, default=None)
     p.add_argument("--dedipole_checkpoint", type=str, default=None)
-    p.add_argument("--polar_model_type", type=str, default="inter", choices=["inter", "intra"])
-    p.add_argument("--dedipole_model_type", type=str, default="inter", choices=["inter", "intra"])
-    p.add_argument("--num_parts", type=int, default=4)
+    p.add_argument("--radius_cutoff", type=float, default=5.0,
+                    help="Must match the radius_cutoff the checkpoint was trained with.")
     p.add_argument("--max_degree", type=int, default=2)
     p.add_argument("--feature_dim", type=int, default=32)
     p.add_argument("--hidden_dim", type=int, default=64)
-    p.add_argument("--num_layers", type=int, default=4)
-    p.add_argument("--partition_type", type=str, default="spectral")
     p.add_argument("--delta", type=float, default=0.01,
                     help="Finite-difference step (angstrom) for the Raman derivative.")
-    p.add_argument("--cutoff", type=float, default=5.0)
     p.add_argument("--freq_match_tol", type=float, default=25.0,
                     help="cm^-1 tolerance for matching predicted modes to reference peaks.")
     p.add_argument("--hessian_unit_factor", type=float, default=HARTREE_BOHR2_AMU_TO_CM1,
@@ -179,10 +171,10 @@ def main():
 
     polar_model = None
     if args.polar_checkpoint:
-        polar_model = load_trained_model(args.polar_checkpoint, "polar", args.polar_model_type, args, device)
+        polar_model = load_trained_model(args.polar_checkpoint, "polar", args, device)
     dedipole_model = None
     if args.dedipole_checkpoint:
-        dedipole_model = load_trained_model(args.dedipole_checkpoint, "dedipole", args.dedipole_model_type, args, device)
+        dedipole_model = load_trained_model(args.dedipole_checkpoint, "dedipole", args, device)
 
     if polar_model is None and dedipole_model is None:
         raise ValueError("Provide at least one of --polar_checkpoint / --dedipole_checkpoint.")
@@ -199,8 +191,7 @@ def main():
         try:
             freqs_cm, ir_int, raman_act = compute_predicted_spectra_for_molecule(
                 args.hessian_h5, group_name, polar_model, dedipole_model, device,
-                delta=args.delta, cutoff=args.cutoff, num_parts=args.num_parts,
-                hessian_unit_factor=args.hessian_unit_factor,
+                delta=args.delta, hessian_unit_factor=args.hessian_unit_factor,
             )
         except Exception as e:
             print(f"Skipping {group_name}: {e}")

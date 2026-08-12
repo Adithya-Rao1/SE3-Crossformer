@@ -2,10 +2,7 @@ import math
 import pytest
 import torch
 
-from src.se3_crossformer.model import (
-    SE3InterNeighborhoodTransformer,
-    SE3IntraOnlyTransformer,
-)
+from src.se3_crossformer.model import SE3IntraOnlyTransformer
 from src.se3_crossformer.se3_utils import RadialNetworkGSFB
 
 torch.manual_seed(0)
@@ -30,7 +27,7 @@ def qvec_to_matrix(q: torch.Tensor) -> torch.Tensor:
     row2 = torch.stack([Qxz, Qyz, Qzz], dim=-1)
     return torch.stack([row0, row1, row2], dim=-2)
 
-def make_toy_graph(n_atoms=12, n_atom_types=5, num_parts=4, seed=0):
+def make_toy_graph(n_atoms=12, n_atom_types=5, seed=0):
     g = torch.Generator().manual_seed(seed)
 
     x = torch.randn(n_atoms, 3, generator=g).double()
@@ -60,21 +57,26 @@ def make_toy_graph(n_atoms=12, n_atom_types=5, num_parts=4, seed=0):
 
     return node_features, x, edge_index, edge_attr, atomic_masses, batch
 
-MODEL_CLASSES = [SE3InterNeighborhoodTransformer, SE3IntraOnlyTransformer]
+MODEL_CLASSES = [SE3IntraOnlyTransformer]
 TASKS = [0, 1, 2, 3]
 
-def build_model(model_cls, in_features, task, num_parts=4, max_degree=2):
+# torch.randn(n_atoms, 3) toy positions are roughly unit-scale, so pairwise
+# distances mostly land in ~0.5-3.0 -- a small radius_cutoff here (unlike the
+# 5.0 default meant for real Angstrom-scale molecules) is what actually
+# exercises the neighbor-list padding/masking logic instead of trivially
+# connecting every atom to every other atom.
+TEST_RADIUS_CUTOFF = 1.3
+
+def build_model(model_cls, in_features, task, radius_cutoff=TEST_RADIUS_CUTOFF, max_degree=2):
     model = model_cls(
         radial_net=RadialNetworkGSFB,
         in_features=in_features,
         max_degree=max_degree,
-        num_layers=2,
         feature_dim=16,
         hidden_dim=32,
-        num_parts=num_parts,
+        radius_cutoff=radius_cutoff,
         scalar_out_dim=1,
         task=task,
-        partition_type="spectral",
     )
     model.double().eval()
     return model
@@ -114,7 +116,7 @@ def assert_tensor_invariant(out_raw, out_tf):
 def test_rotation_equivariance(model_cls, task):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=42
+        n_atoms=12, n_atom_types=n_atom_types, seed=42
     )
     model = build_model(model_cls, in_features=n_atom_types, task=task)
 
@@ -142,7 +144,7 @@ def test_rotation_equivariance(model_cls, task):
 def test_translation_invariance(model_cls, task):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=7
+        n_atoms=12, n_atom_types=n_atom_types, seed=7
     )
     model = build_model(model_cls, in_features=n_atom_types, task=task)
 
@@ -171,7 +173,7 @@ def test_combined_rotation_and_translation(model_cls, task):
     """SE(3) = rotation followed by translation, applied together."""
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=14, n_atom_types=n_atom_types, num_parts=4, seed=99
+        n_atoms=14, n_atom_types=n_atom_types, seed=99
     )
     model = build_model(model_cls, in_features=n_atom_types, task=task)
 

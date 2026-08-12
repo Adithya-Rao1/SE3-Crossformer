@@ -1,7 +1,7 @@
 from math import pi, sqrt
 from functools import reduce, lru_cache
 from operator import mul
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import math
 
 import torch
@@ -152,29 +152,33 @@ class RadialNetworkGSFB(nn.Module):
  
     def __init__(
         self,
-        num_basis:     None = None,        
+        num_basis:     None = None,
         hidden_dim:    int = 32,
         cutoff_radius: float = 5.0,
         orders:        Tuple[int, ...] = (0, 1, 2, 3),
         N_cheb:        int = 64,
         seg_width:     float = 80.0,
+        num_heads:     int = 1,
+        edge_feature_dim: int = 0,
     ):
         super().__init__()
         self.cutoff_radius = float(cutoff_radius)
         self.orders         = tuple(int(o) for o in orders)
         self.num_orders      = len(self.orders)
- 
+        self.num_heads       = num_heads
+        self.edge_feature_dim = edge_feature_dim
+
         table = self._get_or_build_table(self.orders, self.cutoff_radius, N_cheb, seg_width)
- 
+
         self.register_buffer("_coeffs", table.coeffs.clone())
         self.n_seg             = table.n_seg
         self.seg_width_actual  = table.seg_width_actual
         self.N_cheb             = table.N_cheb
- 
+
         self.net = nn.Sequential(
-            nn.Linear(self.num_orders, hidden_dim, bias=False),
+            nn.Linear(self.num_orders + edge_feature_dim, hidden_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1, bias=False),
+            nn.Linear(hidden_dim, num_heads, bias=False),
         )
  
     @classmethod
@@ -206,9 +210,11 @@ class RadialNetworkGSFB(nn.Module):
         jl       = (c * T_basis.unsqueeze(0)).sum(dim=-1)               
         return jl.t().to(r.dtype)                                       
  
-    def forward(self, r: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        basis = self._basis(r)         
-        return self.net(basis)        
+    def forward(self, r: torch.Tensor, edge_feat: Optional[torch.Tensor] = None, *args, **kwargs) -> torch.Tensor:
+        basis = self._basis(r)
+        if self.edge_feature_dim > 0:
+            basis = torch.cat([basis, edge_feat], dim=-1)
+        return self.net(basis)
 
 class RadialNetworkGRBF(nn.Module):
     def __init__(
@@ -216,12 +222,16 @@ class RadialNetworkGRBF(nn.Module):
         num_basis:     int   = 8,
         hidden_dim:    int   = 32,
         cutoff_radius: float = 5.0,
+        num_heads:     int = 1,
+        edge_feature_dim: int = 0,
     ):
         super().__init__()
         self.num_basis     = num_basis
         self.cutoff_radius = cutoff_radius
+        self.num_heads     = num_heads
+        self.edge_feature_dim = edge_feature_dim
 
-        centres = torch.linspace(0.0, cutoff_radius, num_basis)   
+        centres = torch.linspace(0.0, cutoff_radius, num_basis)
         self.register_buffer("centres", centres)
 
         width = cutoff_radius / max(num_basis - 1, 1)
@@ -232,17 +242,14 @@ class RadialNetworkGRBF(nn.Module):
 
         # f(r) = 0.5*(cos(pi*r/cutoff)+1) for r < cutoff, else 0
         self.net = nn.Sequential(
-            nn.Linear(num_basis, hidden_dim, bias=False),
+            nn.Linear(num_basis + edge_feature_dim, hidden_dim, bias=False),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1, bias=False),
+            nn.Linear(hidden_dim, num_heads, bias=False),
         )
 
     def _basis(self, r: torch.Tensor) -> torch.Tensor:
-        """
-        Gaussian RBF basis.
-        """
         diff    = r - self.centres.unsqueeze(0)          
         rbf     = torch.exp(self.inv_width_sq * diff * diff) 
 
@@ -251,79 +258,143 @@ class RadialNetworkGRBF(nn.Module):
 
         return rbf * envelope   
 
-    def forward(self, r: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        basis = self._basis(r)          
-        return self.net(basis)        
+    def forward(self, r: torch.Tensor, edge_feat: Optional[torch.Tensor] = None, *args, **kwargs) -> torch.Tensor:
+        basis = self._basis(r)
+        if self.edge_feature_dim > 0:
+            basis = torch.cat([basis, edge_feat], dim=-1)
+        return self.net(basis)
 
-def equivariant_weight_matrix(
-    x:          torch.Tensor,   
-    l:          int,
-    k:          int,
-    radial_net: nn.Module,
-) -> torch.Tensor:               
-    """
-    Equivariant weight matrix W^{lk}(x) summed over all valid J channels.
-    """
-    from .irr_rep import x_to_alpha_beta
+def _batched_linear_stack(
+    nets:      list,
+    seq_attr:  str,
+    layer_idx: int,
+    h:         torch.Tensor,
+) -> torch.Tensor:
+    layer0  = getattr(nets[0], seq_attr)[layer_idx]
+    W_stack = torch.stack([getattr(n, seq_attr)[layer_idx].weight for n in nets], dim=0)  
+    out = torch.einsum("moi,...mi->...mo", W_stack, h)
+    if layer0.bias is not None:
+        b_stack = torch.stack([getattr(n, seq_attr)[layer_idx].bias for n in nets], dim=0) 
+        out = out + b_stack
+    return out
 
-    device, dtype = x.device, x.dtype
-    N = x.shape[0]
-    W = torch.zeros(N, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype)
 
-    if N == 0:
-        return W
-
-    r      = x.norm(dim=-1, keepdim=True).clamp(min=1e-8) 
-    alphas, betas = x_to_alpha_beta(x)                     
-
-    cg = clebsch_gordan_matrix(l, k)   
-
-    for J in range(abs(l - k), l + k + 1):
-        if J not in cg:
-            continue
-
-        if isinstance(radial_net, nn.ModuleDict):
-            if str(J) not in radial_net:
-                continue
-            rnet = radial_net[str(J)]
+def _batched_sequential_apply(nets: list, seq_attr: str, h: torch.Tensor) -> torch.Tensor:
+    ref_seq = getattr(nets[0], seq_attr)
+    for idx, layer in enumerate(ref_seq):
+        if isinstance(layer, nn.Linear):
+            h = _batched_linear_stack(nets, seq_attr, idx, h)
         else:
-            rnet = radial_net
+            h = layer(h)
+    return h
 
-        phi = rnet(r)                                       
 
-        Q_J = cg[J].to(device=device, dtype=dtype)          
+def _batched_radial_forward(
+    nets:      list,
+    r:         torch.Tensor,
+    edge_feat: Optional[torch.Tensor],
+) -> torch.Tensor:
+    M   = len(nets)
+    ref = nets[0]
 
-        Y_J = get_spherical_harmonics(
-            J, theta=(math.pi - betas), phi=alphas
-        )                                                     
+    basis = ref._basis(r)
+    if ref.edge_feature_dim > 0:
+        basis = torch.cat([basis, edge_feat], dim=-1)
 
-        QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)           
-        had = phi * QTY                                      
-        W   = W + had.view(N, 2 * l + 1, 2 * k + 1)
+    h = basis.unsqueeze(-2).expand(*basis.shape[:-1], M, basis.shape[-1])   
+    return _batched_sequential_apply(nets, "net", h)   
 
-    return W
+
+def _batched_norm_readout_forward(nets: list, x: torch.Tensor) -> torch.Tensor:
+    W_proj = torch.stack([n.equiv_proj.weight for n in nets], dim=0)   
+    v_all  = torch.einsum("mhc,scd->smhd", W_proj, x)                  
+    eps    = nets[0].eps
+    norms  = torch.sqrt((v_all ** 2).sum(dim=-1) + eps)                
+    out    = _batched_sequential_apply(nets, "mlp", norms)              
+    return out.squeeze(-1)                                             
+
 
 def apply_direct_sum_W(
     f:           Dict[int, torch.Tensor],
     x:           torch.Tensor,
     radial_nets: nn.ModuleDict,
     max_degree:  int,
+    num_heads:   int = 1,
+    edge_feat:   Optional[torch.Tensor] = None,
 ) -> Dict[int, torch.Tensor]:
-    out: Dict[int, torch.Tensor] = {}
+    from .irr_rep import x_to_alpha_beta
 
+    device, dtype = x.device, x.dtype
+    N = x.shape[0]
+
+    out: Dict[int, torch.Tensor] = {}
     for l in range(max_degree + 1):
         any_k = next(iter(f.values()))
         C     = any_k.shape[-2]
-
+        assert C % num_heads == 0, \
+            f"channel count {C} not divisible by num_heads {num_heads}"
         out[l] = torch.zeros(
-            *x.shape[:-1], C, 2 * l + 1,
-            device=x.device, dtype=x.dtype,
+            *x.shape[:-1], C, 2 * l + 1, device=device, dtype=dtype,
         )
+
+    if N == 0:
+        return out
+
+    r = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    alphas, betas = x_to_alpha_beta(x)
+
+    groups: Dict[int, list] = {}
+    cg_by_lk: Dict[Tuple[int, int], Dict[int, torch.Tensor]] = {}
+    for l in range(max_degree + 1):
+        for k in range(max_degree + 1):
+            cg = clebsch_gordan_matrix(l, k)
+            cg_by_lk[(l, k)] = cg
+            key = f"{l}_{k}"
+            for J in range(abs(l - k), l + k + 1):
+                if J not in cg or str(J) not in radial_nets[key]:
+                    continue
+                net = radial_nets[key][str(J)]
+                in_dim = net.net[0].weight.shape[1]
+                groups.setdefault(in_dim, []).append((l, k, J, net))
+
+    phi_by_ljk: Dict[Tuple[int, int, int], torch.Tensor] = {}
+    for members in groups.values():
+        nets = [m[3] for m in members]
+        phi_batched = _batched_radial_forward(nets, r, edge_feat)   
+        for i, (l, k, J, _net) in enumerate(members):
+            phi_by_ljk[(l, k, J)] = phi_batched[:, i, :]            
+
+    sh_cache: Dict[int, torch.Tensor] = {}
+    def _sh(J: int) -> torch.Tensor:
+        if J not in sh_cache:
+            sh_cache[J] = get_spherical_harmonics(J, theta=(math.pi - betas), phi=alphas)
+        return sh_cache[J]
+
+    for l in range(max_degree + 1):
+        any_k = next(iter(f.values()))
+        C = any_k.shape[-2]
+        head_dim = C // num_heads
 
         for k in range(max_degree + 1):
             key = f"{l}_{k}"
-            W   = equivariant_weight_matrix(x, l, k, radial_nets[key])
-            contrib = torch.einsum("...ij,...cj->...ci", W, f[k])
+            any_net = next(iter(radial_nets[key].values()))
+            H = any_net.num_heads
+            cg = cg_by_lk[(l, k)]
+
+            W = torch.zeros(N, H, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype)
+            for J in range(abs(l - k), l + k + 1):
+                if (l, k, J) not in phi_by_ljk:
+                    continue
+                phi = phi_by_ljk[(l, k, J)]
+                Q_J = cg[J].to(device=device, dtype=dtype)
+                Y_J = _sh(J)
+                QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)
+                had = phi.unsqueeze(-1) * QTY.unsqueeze(1)
+                W   = W + had.view(N, H, 2 * l + 1, 2 * k + 1)
+
+            f_k_headed = f[k].reshape(*f[k].shape[:-2], num_heads, head_dim, f[k].shape[-1])
+            contrib = torch.einsum("...hij,...hcj->...hci", W, f_k_headed)
+            contrib = contrib.reshape(*contrib.shape[:-3], C, 2 * l + 1)
             out[l]  = out[l] + contrib
 
     return out
@@ -356,8 +427,11 @@ def softmax_over_neighbors(
     mask:   torch.Tensor = None,
 ) -> torch.Tensor:
     if mask is not None:
+        if mask.dim() < scores.dim():
+            mask = mask.unsqueeze(-1).expand_as(scores)
         scores = scores.masked_fill(~mask, float(-1e9))
-    attn = torch.nn.functional.softmax(scores + 1e-8, dim=-1)
+    dim = -2 if scores.dim() >= 3 else -1
+    attn = torch.nn.functional.softmax(scores + 1e-8, dim=dim)
     return torch.nan_to_num(attn, nan=1e-9)
 
 
@@ -409,6 +483,14 @@ class IrrepLinear(nn.Module):
         x = self.weight(x)
         return x.transpose(-1,-2)
 
+class EquivariantLinear(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(cout, cin))
+
+    def forward(self, x):
+        return torch.einsum("oc,...cm->...om", self.weight, x)
+
 class EquivariantReadout(nn.Module):
     def __init__(self, C: int, hidden: int = 64):
         super().__init__()
@@ -441,25 +523,3 @@ def cg_for_J(l: int, k: int, J: int) -> torch.Tensor:
     from src.se3_crossformer.se3_utils import clebsch_gordan_matrix
     return clebsch_gordan_matrix(l, k)[J]
 
-def equivariant_weight_single_J(
-    x:   torch.Tensor,  
-    l:   int,
-    k:   int,
-    J:   int,
-    phi: torch.Tensor,  
-) -> torch.Tensor:     
-
-    device, dtype = x.device, x.dtype
-
-    if x.shape[0] == 0:
-        return torch.zeros(0, 2 * l + 1, 2 * k + 1, device=device, dtype=dtype)
-
-    cg    = clebsch_gordan_matrix(l, k)
-    Q_J   = cg[J].to(device=device, dtype=dtype) 
-
-    alphas, betas = x_to_alpha_beta(x)            
-    Y_J = get_spherical_harmonics(J, theta=(math.pi - betas), phi=alphas) 
-
-    QTY = torch.einsum("ji,ni->nj", Q_J, Y_J)
-    had = phi * QTY                               
-    return had.view(x.shape[0], 2 * l + 1, 2 * k + 1)

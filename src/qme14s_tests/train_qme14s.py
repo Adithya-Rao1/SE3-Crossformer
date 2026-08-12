@@ -4,13 +4,13 @@ import os
 import h5py
 import torch
 import torch.nn as nn
+from rdkit import Chem
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-from src.se3_crossformer.model import SH1_TO_CARTESIAN, SH2_TO_CARTESIAN, SE3InterNeighborhoodTransformer, SE3IntraOnlyTransformer
-from src.se3_crossformer.spectral_partition import subgraph_center_of_mass
+from src.se3_crossformer.model import SH1_TO_CARTESIAN, SH2_TO_CARTESIAN, SE3IntraOnlyTransformer
 from src.se3_crossformer.se3_utils import *
 from src.training_monitor import SystemMonitor
 
@@ -18,6 +18,17 @@ ATOMIC_MASSES = {
     1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999, 9: 18.998, 16: 32.06
 }
 ATOM_TYPES = [1, 6, 7, 8, 9]
+
+# Mirrors src/load_data.py's BOND_TYPES ordering for QM9 -- kept identical so
+# a one-hot bond feature means the same thing across both datasets.
+BOND_TYPES = [
+    Chem.BondType.SINGLE,
+    Chem.BondType.DOUBLE,
+    Chem.BondType.TRIPLE,
+    Chem.BondType.AROMATIC,
+]
+
+_warned_no_smiles = False
 
 
 def get_atomic_masses(z: torch.Tensor) -> torch.Tensor:
@@ -31,6 +42,54 @@ def one_hot_z(z: torch.Tensor) -> torch.Tensor:
     for idx, a in enumerate(ATOM_TYPES):
         one_hot[:, idx] = (z == a).float()
     return one_hot
+
+
+def _build_edge_attr_from_smiles(smiles: str, edge_index: torch.Tensor, n_atoms: int):
+    """Best-effort bond-order/type one-hot for each edge in `edge_index`, built
+    by parsing the molecule's SMILES with RDKit -- mirrors src/load_data.py's
+    CustomQM9Dataset pattern. Returns None if the SMILES is missing, fails to
+    parse, or its atom count doesn't match `n_atoms` (i.e. atom-index
+    alignment between the RDKit mol and the HDF5 pos/z arrays can't be
+    trusted), so callers should treat a None return as "no bond features
+    available for this molecule" rather than an error.
+    """
+    global _warned_no_smiles
+    if not smiles:
+        return None
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    mol = Chem.AddHs(mol)
+    if mol.GetNumAtoms() != n_atoms:
+        # Atom count mismatch means RDKit's atom ordering can't be trusted to
+        # line up with the HDF5 z/pos ordering -- skip rather than guess.
+        if not _warned_no_smiles:
+            print(
+                "Warning: RDKit atom count from SMILES doesn't match HDF5 "
+                "atom count for at least one molecule -- bond features will "
+                "be skipped for those molecules. This needs verifying against "
+                "the real QMe14S HDF5 schema (atom-index alignment between "
+                "the stored 'smile' attribute and pos/z is assumed, not confirmed)."
+            )
+            _warned_no_smiles = True
+        return None
+
+    bond_lookup = {}
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bond_type = bond.GetBondType()
+        onehot = [1.0 if bond_type == t else 0.0 for t in BOND_TYPES]
+        bond_lookup[(i, j)] = onehot
+        bond_lookup[(j, i)] = onehot
+
+    src, dst = edge_index[0].tolist(), edge_index[1].tolist()
+    edge_features = [
+        bond_lookup.get((i, j), [0.0] * len(BOND_TYPES))
+        for i, j in zip(src, dst)
+    ]
+    return torch.tensor(edge_features, dtype=torch.float32)
+
 
 class HDF5Dataset(torch.utils.data.Dataset):
     def __init__(self, h5_path: str, field: str):
@@ -55,7 +114,15 @@ class HDF5Dataset(torch.utils.data.Dataset):
                     continue
 
                 target = polar if field == "polar" else dedipole
-                self.samples.append(Data(edge_index=edge_index, pos=pos, z=z, y=target))
+
+                smiles = group.attrs.get("smile", group.attrs.get("smiles"))
+                if smiles is not None and not isinstance(smiles, str):
+                    smiles = smiles.decode("utf-8") if isinstance(smiles, bytes) else str(smiles)
+                edge_attr = _build_edge_attr_from_smiles(smiles, edge_index, z.shape[0])
+
+                self.samples.append(
+                    Data(edge_index=edge_index, edge_attr=edge_attr, pos=pos, z=z, y=target)
+                )
 
     def __len__(self):
         return len(self.samples)
@@ -191,77 +258,64 @@ class _ForwardMixin:
         seeded = self._seed_equivariant_features(f0, x, atomic_masses, batch)
         f = {0: f0, 1: seeded[1], 2: seeded[2]}
 
-        ptr = [0]
-        for g in range(B):
-            ptr.append(int((batch <= g).sum().item()))
+        counts_per_graph = torch.bincount(batch, minlength=B)
+        ptr = [0] + torch.cumsum(counts_per_graph, dim=0).tolist()
 
-        node_to_subgraph_list, x_cm_list, subgraph_mask_list = [], [], []
-        neighbor_idx_list, neighbor_mask_list = [], []
+        num_bond_feats = edge_attr.shape[-1] if edge_attr is not None else 0
 
-        subgraph_offset = 0
-        K_global = 0
         per_graph = []
-        partition_key = self._partition_config_key()
-
+        K_global = 0
         for g in range(B):
             lo, hi = ptr[g], ptr[g + 1]
             n_g = hi - lo
 
             pos_g = x[lo:hi]
-            mass_g = atomic_masses[lo:hi]
             mask_e = (edge_index[0] >= lo) & (edge_index[0] < hi)
             ei_g = edge_index[:, mask_e] - lo
             edge_attr_g = edge_attr[mask_e] if edge_attr is not None else None
 
-            cache_key = self._edge_hash(ei_g.cpu(), n_g, partition_key)
-            if cache_key in self._graph_cache:
-                n2s_local, xcm, smask, nidx_local, nmask = self._graph_cache[cache_key]
-                xcm = subgraph_center_of_mass(pos_g, mass_g, n2s_local, self.num_parts)
-            else:
-                n2s_local, xcm, smask = self._build_subgraph_info(
-                    ei_g, n_g, pos_g, mass_g, edge_attr=edge_attr_g
-                )
-                nidx_local, nmask = self._build_neighbor_info(ei_g, n2s_local, n_g)
-                self._graph_cache[cache_key] = (n2s_local, xcm, smask, nidx_local, nmask)
+            nidx_local, nmask = self._build_radius_neighbor_info(pos_g, n_g)
 
-            per_graph.append((
-                n2s_local + subgraph_offset, xcm, smask,
-                nidx_local + lo, nmask,
-            ))
-            subgraph_offset += self.num_parts
+            if self.use_bond_info and edge_attr_g is not None:
+                bond_lookup = torch.zeros(
+                    n_g, n_g, num_bond_feats, device=x.device, dtype=edge_attr_g.dtype
+                )
+                bond_lookup[ei_g[0], ei_g[1]] = edge_attr_g
+                nbond_local = bond_lookup[
+                    torch.arange(n_g, device=x.device).unsqueeze(1), nidx_local
+                ]
+                nbond_local = nbond_local * nmask.unsqueeze(-1).to(nbond_local.dtype)
+            else:
+                nbond_local = None
+
+            per_graph.append((nidx_local + lo, nmask, nbond_local))
             K_global = max(K_global, nidx_local.shape[1])
 
-        for g, (n2s, xcm, smask, nidx, nmask) in enumerate(per_graph):
+        neighbor_idx_list, neighbor_mask_list, neighbor_bond_list = [], [], []
+        for nidx, nmask, nbond in per_graph:
             K_g = nidx.shape[1]
             if K_g < K_global:
                 pad_idx = torch.zeros(nidx.shape[0], K_global - K_g, dtype=torch.long, device=x.device)
                 pad_mask = torch.zeros(nmask.shape[0], K_global - K_g, dtype=torch.bool, device=x.device)
                 nidx = torch.cat([nidx, pad_idx], dim=1)
                 nmask = torch.cat([nmask, pad_mask], dim=1)
-            node_to_subgraph_list.append(n2s)
-            x_cm_list.append(xcm)
-            subgraph_mask_list.append(smask)
+                if nbond is not None:
+                    pad_bond = torch.zeros(nbond.shape[0], K_global - K_g, num_bond_feats,
+                                           dtype=nbond.dtype, device=x.device)
+                    nbond = torch.cat([nbond, pad_bond], dim=1)
             neighbor_idx_list.append(nidx)
             neighbor_mask_list.append(nmask)
+            if nbond is not None:
+                neighbor_bond_list.append(nbond)
 
-        node_to_subgraph = torch.cat(node_to_subgraph_list, dim=0)
-        x_cm_all = torch.cat(x_cm_list, dim=0)
         neighbor_idx = torch.cat(neighbor_idx_list, dim=0)
         neighbor_mask = torch.cat(neighbor_mask_list, dim=0)
+        neighbor_bond_attr = torch.cat(neighbor_bond_list, dim=0) if neighbor_bond_list else None
 
-        S_total = B * self.num_parts
-        subgraph_mask_all = torch.zeros(S_total, S_total, dtype=torch.bool, device=x.device)
-        for g, smask in enumerate(subgraph_mask_list):
-            lo = g * self.num_parts
-            hi = lo + self.num_parts
-            subgraph_mask_all[lo:hi, lo:hi] = smask
-
-        for layer in self.layers:
-            f, _ = layer(
-                f_in=f, x=x, neighbor_idx=neighbor_idx, neighbor_mask=neighbor_mask,
-                x_cm=x_cm_all, node_to_subgraph=node_to_subgraph,
-                subgraph_mask=subgraph_mask_all,
-            )
+        f, _ = self.layer(
+            f_in=f, x=x, neighbor_idx=neighbor_idx, neighbor_mask=neighbor_mask,
+            neighbor_bond_attr=neighbor_bond_attr,
+        )
 
         if getattr(self.head, "per_atom", False):
             return self.head(f[0], f[1], f[2])
@@ -273,104 +327,46 @@ class _ForwardMixin:
 
         return self.head(f0_pooled, f1_pooled, f2_pooled)
 
-class SE3PolarizabilityInterTransformer(_ForwardMixin, SE3InterNeighborhoodTransformer):
-    def __init__(self, radial_net, in_features, max_degree=2, num_layers=4,
-                 feature_dim=32, hidden_dim=64, num_parts=4,
-                 partition_type="spectral", knn_k=10, use_bond_info=True,
-                 bond_order_power=1.0, use_connectivity_features=False):
-        super().__init__(
-            radial_net=radial_net, in_features=in_features, max_degree=max_degree,
-            num_layers=num_layers, feature_dim=feature_dim, hidden_dim=hidden_dim,
-            num_parts=num_parts, scalar_out_dim=1, task=3,
-            partition_type=partition_type, knn_k=knn_k, use_bond_info=use_bond_info,
-            bond_order_power=bond_order_power, use_connectivity_features=use_connectivity_features,
-        )
-        self.head = PolarizabilityHead(feature_dim, hidden_dim)
-
 class SE3PolarizabilityIntraTransformer(_ForwardMixin, SE3IntraOnlyTransformer):
-    def __init__(self, radial_net, in_features, max_degree=2, num_layers=4,
-                 feature_dim=32, hidden_dim=64, num_parts=4,
-                 partition_type="spectral", knn_k=10, use_bond_info=True,
-                 bond_order_power=1.0, use_connectivity_features=False):
+    def __init__(self, radial_net, in_features, max_degree=2,
+                 feature_dim=32, hidden_dim=64, radius_cutoff=5.0, use_bond_info=True):
         super().__init__(
             radial_net=radial_net, in_features=in_features, max_degree=max_degree,
-            num_layers=num_layers, feature_dim=feature_dim, hidden_dim=hidden_dim,
-            num_parts=num_parts, scalar_out_dim=1, task=3,
-            partition_type=partition_type, knn_k=knn_k, use_bond_info=use_bond_info,
-            bond_order_power=bond_order_power, use_connectivity_features=use_connectivity_features,
+            feature_dim=feature_dim, hidden_dim=hidden_dim,
+            radius_cutoff=radius_cutoff, scalar_out_dim=1, task=3,
+            use_bond_info=use_bond_info,
         )
         self.head = PolarizabilityHead(feature_dim, hidden_dim)
-
-class SE3DeDipoleInterTransformer(_ForwardMixin, SE3InterNeighborhoodTransformer):
-    def __init__(self, radial_net, in_features, max_degree=2, num_layers=4,
-                 feature_dim=32, hidden_dim=64, num_parts=4,
-                 partition_type="spectral", knn_k=10, use_bond_info=True,
-                 bond_order_power=1.0, use_connectivity_features=False):
-        super().__init__(
-            radial_net=radial_net, in_features=in_features, max_degree=max_degree,
-            num_layers=num_layers, feature_dim=feature_dim, hidden_dim=hidden_dim,
-            num_parts=num_parts, scalar_out_dim=1, task=3,
-            partition_type=partition_type, knn_k=knn_k, use_bond_info=use_bond_info,
-            bond_order_power=bond_order_power, use_connectivity_features=use_connectivity_features,
-        )
-        self.head = DeDipoleHead(feature_dim, hidden_dim)
 
 class SE3DeDipoleIntraTransformer(_ForwardMixin, SE3IntraOnlyTransformer):
-    def __init__(self, radial_net, in_features, max_degree=2, num_layers=4,
-                 feature_dim=32, hidden_dim=64, num_parts=4,
-                 partition_type="spectral", knn_k=10, use_bond_info=True,
-                 bond_order_power=1.0, use_connectivity_features=False):
+    def __init__(self, radial_net, in_features, max_degree=2,
+                 feature_dim=32, hidden_dim=64, radius_cutoff=5.0, use_bond_info=True):
         super().__init__(
             radial_net=radial_net, in_features=in_features, max_degree=max_degree,
-            num_layers=num_layers, feature_dim=feature_dim, hidden_dim=hidden_dim,
-            num_parts=num_parts, scalar_out_dim=1, task=3,
-            partition_type=partition_type, knn_k=knn_k, use_bond_info=use_bond_info,
-            bond_order_power=bond_order_power, use_connectivity_features=use_connectivity_features,
+            feature_dim=feature_dim, hidden_dim=hidden_dim,
+            radius_cutoff=radius_cutoff, scalar_out_dim=1, task=3,
+            use_bond_info=use_bond_info,
         )
         self.head = DeDipoleHead(feature_dim, hidden_dim)
 
-def _filter_small_graphs(batch, num_parts, device, field="polar"):
+def _prepare_batch(batch, device, field="polar"):
     graph_batch = batch.batch.to(device)
-    counts = torch.bincount(graph_batch)
-    valid_graph = counts >= num_parts
 
     y = batch.y.to(device)
-    target_full = y.view(-1, 3, 3) if field == "polar" else y
+    target = y.view(-1, 3, 3) if field == "polar" else y
 
-    if valid_graph.all():
-        return (
-            one_hot_z(batch.z).to(device),
-            batch.pos.to(device),
-            batch.edge_index.to(device),
-            get_atomic_masses(batch.z).to(device),
-            target_full,
-            graph_batch,
-        )
-
-    keep_nodes = valid_graph[graph_batch]
-    keep_graphs = valid_graph.nonzero(as_tuple=True)[0]
-    if keep_graphs.numel() == 0:
-        return None
-
-    remap = torch.full((valid_graph.shape[0],), -1, dtype=torch.long, device=device)
-    remap[keep_graphs] = torch.arange(keep_graphs.shape[0], device=device)
-
-    node_feat = one_hot_z(batch.z).to(device)[keep_nodes]
-    pos = batch.pos.to(device)[keep_nodes]
-    atomic_mass = get_atomic_masses(batch.z).to(device)[keep_nodes]
-    graph_batch = remap[graph_batch[keep_nodes]]
-    target = target_full[keep_graphs] if field == "polar" else target_full[keep_nodes]
-
-    src, dst = batch.edge_index.to(device)
-    edge_mask = keep_nodes[src] & keep_nodes[dst]
-    old_to_new = torch.full((batch.num_nodes,), -1, dtype=torch.long, device=device)
-    old_to_new[keep_nodes.nonzero(as_tuple=True)[0]] = torch.arange(keep_nodes.sum(), device=device)
-    edge_index = old_to_new[batch.edge_index.to(device)[:, edge_mask]]
-
-    return node_feat, pos, edge_index, atomic_mass, target, graph_batch
+    return (
+        one_hot_z(batch.z).to(device),
+        batch.pos.to(device),
+        batch.edge_index.to(device),
+        get_atomic_masses(batch.z).to(device),
+        target,
+        graph_batch,
+        batch.edge_attr.to(device) if getattr(batch, "edge_attr", None) is not None else None,
+    )
 
 
-def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
+def train_epoch(model, loader, optimizer, device, accum_steps, epoch,
                  monitor: SystemMonitor = None, field: str = "polar"):
     model.train()
     total_loss = 0.0
@@ -380,14 +376,11 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
     optimizer.zero_grad()
     for i, batch in enumerate(loader):
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts, device, field=field)
-        if tensors is None:
-            continue
-        node_feat, pos, edge_index, atomic_mass, target, graph_batch = tensors
-        if graph_batch.max() < 0:
-            continue
+        node_feat, pos, edge_index, atomic_mass, target, graph_batch, edge_attr = _prepare_batch(
+            batch, device, field=field
+        )
 
-        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch, edge_attr=edge_attr)
         loss = nn.functional.mse_loss(pred, target) / accum_steps
         loss.backward()
 
@@ -421,21 +414,18 @@ def train_epoch(model, loader, optimizer, num_parts, device, accum_steps, epoch,
     return epoch_loss
 
 @torch.no_grad()
-def evaluate(model, loader, num_parts, device, epoch=None, field: str = "polar"):
+def evaluate(model, loader, device, epoch=None, field: str = "polar"):
     model.eval()
     total_mse = 0.0
     n_graphs = 0
 
     for batch in loader:
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts, device, field=field)
-        if tensors is None:
-            continue
-        node_feat, pos, edge_index, atomic_mass, target, graph_batch = tensors
-        if graph_batch.max() < 0:
-            continue
+        node_feat, pos, edge_index, atomic_mass, target, graph_batch, edge_attr = _prepare_batch(
+            batch, device, field=field
+        )
 
-        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch, edge_attr=edge_attr)
         mse = nn.functional.mse_loss(pred, target).item()
         B = pred.shape[0]
         total_mse += mse * B
@@ -448,40 +438,35 @@ def evaluate(model, loader, num_parts, device, epoch=None, field: str = "polar")
         print(f"Eval MSE: {epoch_mse:.4f}")
     return epoch_mse
 
-def build_model(model_type: str, args, device):
+def build_model(args, device):
     radial_net = RadialNetworkGSFB
-    if args.field == "polar":
-        cls = SE3PolarizabilityInterTransformer if model_type == "inter" else SE3PolarizabilityIntraTransformer
-    else:
-        cls = SE3DeDipoleInterTransformer if model_type == "inter" else SE3DeDipoleIntraTransformer
+    cls = SE3PolarizabilityIntraTransformer if args.field == "polar" else SE3DeDipoleIntraTransformer
     return cls(
         radial_net=radial_net,
         in_features=len(ATOM_TYPES),
         max_degree=args.max_degree,
-        num_layers=args.num_layers,
         feature_dim=args.feature_dim,
         hidden_dim=args.hidden_dim,
-        num_parts=args.num_parts,
-        partition_type=args.partition_type,
+        radius_cutoff=args.radius_cutoff,
     ).to(device)
 
-def run_ablation_trial(model_type: str, args, device, train_loader, val_loader, test_loader):
-    print(f"\n=== Ablation run: model_type={model_type!r}, prediction_target={args.field!r} ===")
+def run_training(args, device, train_loader, val_loader, test_loader):
+    print(f"\n=== Training: prediction_target={args.field!r} ===")
     torch.manual_seed(args.seed)
 
-    model = build_model(model_type, args, device)
+    model = build_model(args, device)
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     monitor = SystemMonitor(device)
 
-    checkpoint_path = os.path.join(args.metrics_dir, f"best_model_{model_type}.pt")
+    checkpoint_path = os.path.join(args.metrics_dir, "best_model.pt")
     best_val_mse = float("inf")
 
     for epoch in range(args.epochs):
-        print(f"[{model_type}] Epoch {epoch + 1}")
-        train_epoch(model, train_loader, optimizer, args.num_parts, device,
+        print(f"Epoch {epoch + 1}")
+        train_epoch(model, train_loader, optimizer, device,
                     accum_steps=args.accum_steps, epoch=epoch, monitor=monitor, field=args.field)
-        val_mse = evaluate(model, val_loader, args.num_parts, device, epoch, field=args.field)
+        val_mse = evaluate(model, val_loader, device, epoch, field=args.field)
         scheduler.step()
 
         if val_mse < best_val_mse:
@@ -489,28 +474,26 @@ def run_ablation_trial(model_type: str, args, device, train_loader, val_loader, 
             print(f"  [New best] val MSE: {val_mse:.4f} -- saving checkpoint.")
             torch.save(model.state_dict(), checkpoint_path)
 
-    monitor.save_csv(os.path.join(args.metrics_dir, f"metrics_{model_type}.csv"))
+    monitor.save_csv(os.path.join(args.metrics_dir, "metrics.csv"))
     monitor.save_plots(
-        os.path.join(args.metrics_dir, f"metrics_{model_type}.png"),
-        title_prefix=f"field={args.field}, model_type={model_type}",
+        os.path.join(args.metrics_dir, "metrics.png"),
+        title_prefix=f"field={args.field}",
     )
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    test_mse = evaluate(model, test_loader, args.num_parts, device, field=args.field)
-    print(f"[{model_type}] Test MSE: {test_mse:.4f}")
-    return {"model_type": model_type, "best_val_mse": best_val_mse, "test_mse": test_mse}
+    test_mse = evaluate(model, test_loader, device, field=args.field)
+    print(f"Test MSE: {test_mse:.4f}")
+    return {"best_val_mse": best_val_mse, "test_mse": test_mse}
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--h5_path", type=str, default="./data/QMe14S_single_point.h5")
     parser.add_argument("--field", type=str, default="polar", choices=["polar", "dedipole"])
-    parser.add_argument("--num_parts", type=int, default=4)
+    parser.add_argument("--radius_cutoff", type=float, default=5.0)
     parser.add_argument("--max_degree", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--accum_steps", type=int, default=8)
-    parser.add_argument("--partition_type", type=str, default="spectral")
     parser.add_argument("--rbf_type", type=str, default="grbf")
-    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -531,15 +514,8 @@ def main():
 
     train_loader, val_loader, test_loader = load_data(args.h5_path, args.batch_size, args.field)
 
-    results = []
-    for model_type in ("inter", "intra"):
-        results.append(
-            run_ablation_trial(model_type, args, device, train_loader, val_loader, test_loader)
-        )
-
-    print("\n=== Ablation summary ===")
-    for r in results:
-        print(f"  {r['model_type']:>6s} | best val MSE: {r['best_val_mse']:.4f} | test MSE: {r['test_mse']:.4f}")
+    result = run_training(args, device, train_loader, val_loader, test_loader)
+    print(f"\n=== Summary === best val MSE: {result['best_val_mse']:.4f} | test MSE: {result['test_mse']:.4f}")
 
 if __name__ == "__main__":
     main()

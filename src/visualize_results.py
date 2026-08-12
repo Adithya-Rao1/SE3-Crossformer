@@ -9,13 +9,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from src.se3_crossformer.model import SE3InterNeighborhoodTransformer, SE3IntraOnlyTransformer
+from src.se3_crossformer.model import SE3IntraOnlyTransformer
 from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB, RadialNetworkSFB
-from src.train import load_qm9, _filter_small_graphs, ATOM_TYPES
+from src.qm9_tests.train import load_qm9, _filter_small_graphs, ATOM_TYPES
 
-GROUP_ORDER = ["graph_construction", "model_architecture", "rbf"]
+GROUP_ORDER = ["graph_construction", "rbf"]
 RBF_LOOKUP = {"grbf": RadialNetworkGRBF, "gsfb": RadialNetworkGSFB, "sfb": RadialNetworkSFB}
-MODEL_LOOKUP = {"inter": SE3InterNeighborhoodTransformer, "intra_only": SE3IntraOnlyTransformer}
 
 def load_summary(base_metrics_dir):
     path = os.path.join(base_metrics_dir, "summary.csv")
@@ -102,7 +101,7 @@ def plot_wall_time(summary_df, out_dir):
         return
 
     fig, ax = plt.subplots(figsize=(max(8, 0.5 * len(df)), 5))
-    colors = {"graph_construction": "#4C72B0", "model_architecture": "#DD8452", "rbf": "#55A868"}
+    colors = {"graph_construction": "#4C72B0", "rbf": "#55A868"}
     bar_colors = df["group"].map(colors).fillna("#888888")
     ax.bar(np.arange(len(df)), df["wall_time_sec"] / 60.0, color=bar_colors)
     ax.set_xticks(np.arange(len(df)))
@@ -125,7 +124,7 @@ def plot_mae_vs_wall_time(summary_df, out_dir):
         return
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    colors = {"graph_construction": "#4C72B0", "model_architecture": "#DD8452", "rbf": "#55A868"}
+    colors = {"graph_construction": "#4C72B0", "rbf": "#55A868"}
     for group, sub in df.groupby("group"):
         ax.scatter(sub["wall_time_sec"] / 60.0, sub["test_mae"],
                    label=group, color=colors.get(group, "#888888"), s=60, edgecolor="k")
@@ -145,34 +144,32 @@ def plot_mae_vs_wall_time(summary_df, out_dir):
 
 def rebuild_model(row, args, device):
     radial_net = RBF_LOOKUP[row["rbf_type"]]
-    model_cls = MODEL_LOOKUP[row["model_type"]]
-    model = model_cls(
+    model = SE3IntraOnlyTransformer(
         radial_net=radial_net,
         in_features=len(ATOM_TYPES),
         max_degree=args.max_degree,
-        num_layers=args.num_layers,
         feature_dim=args.feature_dim,
         hidden_dim=args.hidden_dim,
-        num_parts=args.num_parts,
-        out_dim=19,
-        task="regression",
-        partition_type=row["partition_type"],
+        radius_cutoff=float(row["radius_cutoff"]),
+        scalar_out_dim=19,
+        task=0,
     ).to(device)
     return model
 
 @torch.no_grad()
-def get_predictions(model, loader, num_parts, device):
+def get_predictions(model, loader, target_idx, device):
     model.eval()
     preds, trues = [], []
     for batch in loader:
         batch = batch.to(device)
-        tensors = _filter_small_graphs(batch, num_parts, device)
+        tensors = _filter_small_graphs(target_idx, batch, 1, device)
         if tensors is None:
             continue
-        node_feat, pos, edge_index, atomic_mass, target, graph_batch = tensors
+        node_feat, pos, edge_index, edge_attr, atomic_mass, target, graph_batch, graph_idx = tensors
         if graph_batch.max() < 0:
             continue
-        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch,
+                     edge_attr=edge_attr, graph_idx=graph_idx)
         preds.append(pred.squeeze(-1).cpu().numpy())
         trues.append(target.cpu().numpy())
     if not preds:
@@ -210,7 +207,7 @@ def plot_lsrl_grid(summary_df, args, device, out_dir, trial=0):
         return {}
 
     print("Loading QM9 test split once for all runs...")
-    _, _, test_loader = load_qm9(args.target, args.batch_size, args.data_root, device)
+    _, _, test_loader = load_qm9(args.batch_size, args.data_root, device)
 
     n = len(ok_rows)
     ncols = min(3, n)
@@ -228,7 +225,7 @@ def plot_lsrl_grid(summary_df, args, device, out_dir, trial=0):
 
         model = rebuild_model(row, args, device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        pred, true = get_predictions(model, test_loader, args.num_parts, device)
+        pred, true = get_predictions(model, test_loader, args.target, device)
         if pred is None:
             ax.set_title(f"{row['swept_param']}\n(no valid test graphs)")
             ax.axis("off")
@@ -254,7 +251,7 @@ def plot_error_distribution_by_group(summary_df, args, device, out_dir, trial=0)
     if ok_rows.empty:
         return
 
-    _, _, test_loader = load_qm9(args.target, args.batch_size, args.data_root, device)
+    _, _, test_loader = load_qm9(args.batch_size, args.data_root, device)
 
     groups = [g for g in summary_df["group"].cat.categories]
     fig, axes = plt.subplots(1, len(groups), figsize=(5 * len(groups), 5), squeeze=False)
@@ -269,7 +266,7 @@ def plot_error_distribution_by_group(summary_df, args, device, out_dir, trial=0)
                 continue
             model = rebuild_model(row, args, device)
             model.load_state_dict(torch.load(ckpt_path, map_location=device))
-            pred, true = get_predictions(model, test_loader, args.num_parts, device)
+            pred, true = get_predictions(model, test_loader, args.target, device)
             if pred is None:
                 continue
             data.append(np.abs(pred - true))
@@ -300,10 +297,8 @@ def parse_args():
     p.add_argument("--trial", type=int, default=0, help="Which trial's checkpoint/history to use.")
 
     p.add_argument("--target", type=int, default=1)
-    p.add_argument("--num_parts", type=int, default=4)
     p.add_argument("--max_degree", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--num_layers", type=int, default=4)
     p.add_argument("--feature_dim", type=int, default=32)
     p.add_argument("--hidden_dim", type=int, default=64)
 

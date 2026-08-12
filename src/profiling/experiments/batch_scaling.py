@@ -34,7 +34,8 @@ def run_batch_scaling_experiment(
     from pathlib import Path
     ROOT = Path(__file__).resolve().parent.parent.parent
     sys.path.insert(0, str(ROOT))
-    from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+    from src.se3_crossformer.model import SE3IntraOnlyTransformer
+    from src.se3_crossformer.se3_utils import RadialNetworkGRBF
     from src.load_data import CustomQM9Dataset
     from torch_geometric.loader import DataLoader
 
@@ -44,18 +45,18 @@ def run_batch_scaling_experiment(
         csv_file = args.data_root + "/qm9/raw/gdb9.sdf.csv",
         device   = torch.device("cpu"),
     )
-    dataset.y = dataset.y[:, args.target]
     dataset = dataset[:min(len(dataset), 2048)]
 
-    model = SE3InterNeighborhoodTransformer(
+    model = SE3IntraOnlyTransformer(
+        radial_net  = RadialNetworkGRBF,
         in_features = len(ATOM_TYPES),
         max_degree  = args.max_degree,
-        num_layers  = args.num_layers,
         feature_dim = args.feature_dim,
         hidden_dim  = args.hidden_dim,
-        num_parts   = args.num_parts,
-        out_dim     = 19,
-        task        = "regression",
+        radius_cutoff = args.radius_cutoff,
+        scalar_out_dim = 1,
+        task        = 0,
+        bond_feature_dim  = getattr(args, "bond_feature_dim", 0),
     ).to(device)
     model.eval()
 
@@ -86,14 +87,17 @@ def run_batch_scaling_experiment(
                 node_feat   = _one_hot_z(batch.x).to(device)
                 pos         = batch.pos.to(device)
                 edge_index  = batch.edge_index.to(device)
+                edge_attr   = batch.edge_attr.to(device)
                 am          = _atomic_masses(batch.x).to(device)
                 graph_batch = batch.batch.to(device)
+                graph_idx   = batch.idx.to(device)
 
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 with torch.no_grad():
-                    _ = model(node_feat, pos, edge_index, am, graph_batch)
+                    _ = model(node_feat, pos, edge_index, am, graph_batch,
+                              edge_attr=edge_attr, graph_idx=graph_idx)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t1 = time.perf_counter()

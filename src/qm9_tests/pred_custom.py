@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from scipy import stats
 
-from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+from src.se3_crossformer.model import SE3IntraOnlyTransformer
 from src.se3_crossformer.se3_utils import RadialNetworkGRBF, RadialNetworkGSFB
 from src.qm9_tests.train import load_qm9, _filter_small_graphs, ATOM_TYPES
 from src.qm9_tests.dummy_data import load_qm9_dummy
@@ -34,22 +34,20 @@ def build_model(args, device):
     else:
         radial_net = RadialNetworkGSFB
 
-    return SE3InterNeighborhoodTransformer(
+    return SE3IntraOnlyTransformer(
         radial_net=radial_net,
         in_features=len(ATOM_TYPES),
         max_degree=args.max_degree,
-        num_layers=args.num_layers,
         feature_dim=args.feature_dim,
         hidden_dim=args.hidden_dim,
-        num_parts=args.num_parts,
+        radius_cutoff=args.radius_cutoff,
         scalar_out_dim=1,
         task=0,
-        partition_type=args.partition_type,
     ).to(device)
 
 
 @torch.no_grad()
-def predict_and_record(model, loader, target_idx, num_parts, device, out_csv):
+def predict_and_record(model, loader, target_idx, device, out_csv):
     model.eval()
     rows = []
     total_abs_err = 0.0
@@ -58,14 +56,15 @@ def predict_and_record(model, loader, target_idx, num_parts, device, out_csv):
 
     for batch in loader:
         batch = batch.to(device)
-        tensors = _filter_small_graphs(target_idx, batch, num_parts, device)
+        tensors = _filter_small_graphs(target_idx, batch, 1, device)
         if tensors is None:
             continue
-        node_feat, pos, edge_index, atomic_mass, target, graph_batch = tensors
+        node_feat, pos, edge_index, edge_attr, atomic_mass, target, graph_batch, graph_idx = tensors
         if graph_batch.max() < 0:
             continue
 
-        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch).squeeze(-1)
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch,
+                     edge_attr=edge_attr, graph_idx=graph_idx).squeeze(-1)
         abs_err = (pred - target).abs()
 
         for p, t, e in zip(pred.tolist(), target.tolist(), abs_err.tolist()):
@@ -87,15 +86,13 @@ def predict_and_record(model, loader, target_idx, num_parts, device, out_csv):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=int, default=1)
-    parser.add_argument("--num_parts", type=int, default=4)
+    parser.add_argument("--radius_cutoff", type=float, default=5.0,
+                         help="Must match the value used at training time.")
     parser.add_argument("--max_degree", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--rbf_type", type=str, default="gsfb",
-                         help="Must match the value used at training time.")
-    parser.add_argument("--partition_type", type=str, default="spectral",
                          help="Must match the value used at training time.")
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--checkpoint_dir", type=str, default="/home/ubuntu/se3-crossformer-data/data",
@@ -138,7 +135,7 @@ def main():
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
 
         out_csv = os.path.join(args.out_dir, f"predictions_trial{trial}.csv")
-        mae = predict_and_record(model, test_loader, args.target, args.num_parts, device, out_csv)
+        mae = predict_and_record(model, test_loader, args.target, device, out_csv)
         print(f"[trial {trial}] test MAE: {mae:.4f}  (predictions -> {out_csv})")
         trial_maes.append(mae)
 
@@ -148,7 +145,7 @@ def main():
     mean_mae, half_width = confidence_interval_95(trial_maes)
 
     summary = {
-        "model": "custom_se3_interneighborhood_transformer",
+        "model": "custom_se3_intraonly_transformer",
         "target_index": args.target,
         "trial_maes": trial_maes,
         "mean_mae": mean_mae,

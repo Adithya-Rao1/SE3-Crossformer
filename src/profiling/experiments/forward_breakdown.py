@@ -50,52 +50,39 @@ def run_forward_breakdown_experiment(
     from pathlib import Path
     ROOT = Path(__file__).resolve().parent.parent.parent
     sys.path.insert(0, str(ROOT))
-    from src.se3_crossformer.model import (
-        SE3InterNeighborhoodTransformer,
-        SE3InterNeighborhoodLayer,
-    )
-    from src.se3_crossformer.spectral_partition import initial_message
+    from src.se3_crossformer.model import SE3IntraOnlyTransformer
+    from src.se3_crossformer.se3_utils import RadialNetworkGRBF
 
-    model = SE3InterNeighborhoodTransformer(
+    # The monkeypatching below reaches into SE3IntraOnlyLayer's own
+    # _intra_update method directly -- the model has exactly one such layer.
+    model = SE3IntraOnlyTransformer(
+        radial_net  = RadialNetworkGRBF,
         in_features = len(ATOM_TYPES),
         max_degree  = args.max_degree,
-        num_layers  = args.num_layers,
         feature_dim = args.feature_dim,
         hidden_dim  = args.hidden_dim,
-        num_parts   = args.num_parts,
-        out_dim     = 19,
-        task        = "regression",
+        radius_cutoff = args.radius_cutoff,
+        scalar_out_dim = 1,
+        task        = 0,
+        bond_feature_dim  = getattr(args, "bond_feature_dim", 0),
     ).to(device)
     model.eval()
 
     timing_store: Dict[str, List[float]] = {}
 
-    original_layer_forwards = {}
-
-    def make_patched_forward(layer_idx, orig_forward):
-        def patched_forward(f_in, x, neighbor_idx, neighbor_mask,
-                            x_cm, node_to_subgraph, subgraph_mask):
-            layer_key = f"layer_{layer_idx}"
-            num_subgraphs = x_cm.shape[0]
-
-            with _timer(timing_store, f"{layer_key}.intra_update"):
+    def make_patched_forward(orig_forward):
+        def patched_forward(f_in, x, neighbor_idx, neighbor_mask, neighbor_bond_attr=None):
+            with _timer(timing_store, "layer_0.intra_update"):
                 f_out = orig_forward.__self__._intra_update(
-                    f_in, x, neighbor_idx, neighbor_mask
+                    f_in, x, neighbor_idx, neighbor_mask,
+                    neighbor_bond_attr=neighbor_bond_attr,
                 )
-            with _timer(timing_store, f"{layer_key}.initial_message"):
-                m_in = initial_message(f_out, node_to_subgraph, num_subgraphs)
-            with _timer(timing_store, f"{layer_key}.message_update"):
-                m_out = orig_forward.__self__._message_update(m_in, x_cm, subgraph_mask)
-            with _timer(timing_store, f"{layer_key}.cross_update"):
-                f_out = orig_forward.__self__._cross_update(
-                    f_out, m_out, x, x_cm, node_to_subgraph, subgraph_mask
-                )
+            m_out: Dict[int, torch.Tensor] = {}
             return f_out, m_out
         return patched_forward
 
-    for i, layer in enumerate(model.layers):
-        original_layer_forwards[i] = layer.forward
-        layer.forward = make_patched_forward(i, layer.forward)
+    original_layer_forward = model.layer.forward
+    model.layer.forward = make_patched_forward(model.layer.forward)
 
     loader_iter = iter(loader)
 
@@ -110,26 +97,30 @@ def run_forward_breakdown_experiment(
         node_feat   = _one_hot_z(batch.x).to(device)
         pos         = batch.pos.to(device)
         edge_index  = batch.edge_index.to(device)
+        edge_attr   = batch.edge_attr.to(device)
         am          = _atomic_masses(batch.x).to(device)
         graph_batch = batch.batch.to(device)
+        graph_idx   = batch.idx.to(device)
+        B           = int(graph_batch.max().item()) + 1
+
+        ptr = [0]
+        for g in range(B):
+            ptr.append(int((graph_batch <= g).sum().item()))
 
         with _timer(timing_store, "graph_build"):
-            B = int(graph_batch.max().item()) + 1
-            pass
+            for g in range(B):
+                lo, hi = ptr[g], ptr[g + 1]
+                _ = model._build_radius_neighbor_info(pos[lo:hi], hi - lo)
+
+        with _timer(timing_store, "input_embedding"):
+            f0 = model.input_embedding(node_feat).unsqueeze(-1)
 
         _cuda_sync()
         t_total0 = time.perf_counter()
 
-        with _timer(timing_store, "input_embedding"):
-            import math
-            N = node_feat.shape[0]
-            f0 = model.input_embedding(node_feat).unsqueeze(-1)
-            f1 = torch.randn(N, f0.shape[1], 3,  device=device) * (1/math.sqrt(3.0))
-            f2 = torch.randn(N, f0.shape[1], 5,  device=device) * (1/math.sqrt(5.0))
-
-        with _timer(timing_store, "graph_build"):
-            with torch.no_grad():
-                _ = model(node_feat, pos, edge_index, am, graph_batch)
+        with torch.no_grad():
+            _ = model(node_feat, pos, edge_index, am, graph_batch,
+                      edge_attr=edge_attr, graph_idx=graph_idx)
 
         _cuda_sync()
         t_total1 = time.perf_counter()
@@ -140,9 +131,7 @@ def run_forward_breakdown_experiment(
             f"total_fwd={timing_store['total_forward'][-1]*1e3:.1f}ms"
         )
 
-    for i, layer in enumerate(model.layers):
-        if i in original_layer_forwards:
-            layer.forward = original_layer_forwards[i]
+    model.layer.forward = original_layer_forward
 
     def _mean(lst):
         return sum(lst) / len(lst) if lst else 0.0

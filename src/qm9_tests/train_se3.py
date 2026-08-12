@@ -188,9 +188,10 @@ def main():
     parser.add_argument("--target_indices", type=list, default=target_indices,
                          help="Target indices for multiple runs")
     parser.add_argument("--min_nodes", type=int, default=4,
-                         help="Drop graphs with fewer atoms than this. Set equal to "
-                              "the custom model's --num_parts to evaluate both models "
-                              "on exactly the same set of molecules.")
+                         help="Drop graphs with fewer atoms than this -- a real constraint "
+                              "of this baseline model's own partitioning (the custom "
+                              "se3-cross model has no such minimum under radius-cutoff "
+                              "neighborhoods).")
     parser.add_argument("--batch_size", type=int, default=8,
                          help="Dense (b, n, n) edge tensors are memory-heavy; "
                               "keep this smaller than the custom model's batch size. "

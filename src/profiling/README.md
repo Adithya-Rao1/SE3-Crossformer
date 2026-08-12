@@ -1,7 +1,7 @@
 # SE3 Transformer Profiling Suite
 
 Diagnostic suite for identifying GPU under-utilisation and per-batch
-slowdowns in the `SE3InterNeighborhoodTransformer` training loop.
+slowdowns in the `SE3IntraOnlyTransformer` training loop.
 
 ---
 
@@ -11,7 +11,7 @@ slowdowns in the `SE3InterNeighborhoodTransformer` training loop.
 # Full suite (all experiments, 20 batches each)
 python profiling/profile_runner.py \
     --target 0 \
-    --num_parts 4 \
+    --radius_cutoff 5.0 \
     --max_degree 2 \
     --data_root ./data \
     --batch_size 16 \
@@ -120,8 +120,8 @@ To evaluate whether they occur once per molecule, epoch, batch, or forward pass
 | 5 | `num_workers` | Samples/sec across `num_workers ∈ {0,2,4,8,16}` |
 | 6 | `batch_scaling` | Samples/sec across batch sizes `{1…512}` |
 | 7 | `cpu_monitor.sh` | Per-core CPU utilisation via `mpstat` |
-| 8 | `graph_construction` | Per sub-step timing: spectral partition / CoM / neighbor build |
-| 9 | `forward_breakdown` | % of forward time per model block (intra/inter/cross/readout) |
+| 8 | `graph_construction` | Radius-neighbor graph build time vs. forward time |
+| 9 | `forward_breakdown` | % of forward time per model block (intra update/readout) |
 | 10 | `kernel_launch` | Kernel launch count vs. useful-work time (via torch.profiler) |
 | 11 | `throughput` | nodes/s, edges/s, samples/s, spherical-harmonic accesses/s |
 | 12 | `graph_construction` | Frequency annotation per graph-pipeline step |
@@ -174,16 +174,13 @@ All cores idle + GPU low util       → Synchronisation bottleneck
 
 ### Graph construction (Exp 8)
 ```
-graph_build_to_forward_ratio > 1.0  → Graph construction dominates; cache or vectorise
-spectral_partition >> others        → Laplacian eigh + k-means is the bottleneck
-neighbor_build  is large            → Python loop in _build_neighbor_info is slow
+graph_build_to_forward_ratio > 1.0  → Graph construction dominates; vectorise the per-molecule loop
+total_graph_build_s is large        → cdist + mask (_build_radius_neighbor_info) is the bottleneck
 ```
 
 ### Forward breakdown (Exp 9)
 ```
-cross_update > 50%                  → _cross_update loop over subgraphs is the bottleneck
 intra_update > 40%                  → equivariant_weight_matrix is slow (SH + CG)
-initial_message > 10%               → Python loop in initial_message is slow
 ```
 
 ### Kernel launch (Exp 10)
@@ -204,10 +201,7 @@ sh_accesses_per_sec                 → Estimated spherical harmonic compute rat
 
 | Finding | Likely fix |
 |---------|-----------|
-| `graph_build/forward_ratio > 1` | Cache spectral partition per molecule; it doesn't change across epochs |
-| `_build_neighbor_info` is slow | Replace Python `adj` list loop with `torch.isin` + masked `edge_index` |
-| `_cross_update` loop over S | Vectorise the `for b in range(S)` loop with batched einsum |
-| `initial_message` slow | Replace Python loop with `scatter_mean` from `torch_scatter` |
+| `graph_build/forward_ratio > 1` | Vectorise `_build_radius_neighbor_info` across molecules instead of a per-molecule Python loop |
 | `gpu_busy_pct < 30%` | Increase batch size; enable `pin_memory=True`; prefetch |
 | `num_workers` helps a lot | The DataLoader is CPU-preprocessing limited |
 | H2D dominates | Set `pin_memory=True` and `non_blocking=True` in `.to(device)` |

@@ -38,17 +38,19 @@ def run_timing_experiment(
 ) -> Dict[str, Any]:
     log.info(f"  Timing experiment: {num_batches} batches on {device}")
 
-    from src.se3_crossformer.model import SE3InterNeighborhoodTransformer
+    from src.se3_crossformer.model import SE3IntraOnlyTransformer
+    from src.se3_crossformer.se3_utils import RadialNetworkGRBF
 
-    model = SE3InterNeighborhoodTransformer(
+    model = SE3IntraOnlyTransformer(
+        radial_net=RadialNetworkGRBF,
         in_features=len(ATOM_TYPES),
         max_degree=args.max_degree,
-        num_layers=args.num_layers,
         feature_dim=args.feature_dim,
         hidden_dim=args.hidden_dim,
-        num_parts=args.num_parts,
-        out_dim=19,
-        task="regression",
+        radius_cutoff=args.radius_cutoff,
+        scalar_out_dim=1,
+        task=0,
+        bond_feature_dim=getattr(args, "bond_feature_dim", 0),
     ).to(device)
 
     optimizer = Adam(model.parameters(), lr=1e-3)
@@ -77,15 +79,18 @@ def run_timing_experiment(
         node_feat    = _one_hot_z(batch.x).to(device)
         pos          = batch.pos.to(device)
         edge_index   = batch.edge_index.to(device)
+        edge_attr    = batch.edge_attr.to(device)
         atomic_mass  = _get_atomic_masses(batch.x).to(device)
-        target       = batch.y.to(device)
+        target       = batch.y[:, args.target].to(device)
         graph_batch  = batch.batch.to(device)
+        graph_idx    = batch.idx.to(device)
         _cuda_sync()
         t3 = time.perf_counter()
         h2d_times.append(t3 - t2)
 
         t4 = time.perf_counter()
-        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch)
+        pred = model(node_feat, pos, edge_index, atomic_mass, graph_batch,
+                     edge_attr=edge_attr, graph_idx=graph_idx)
         loss = nn.functional.l1_loss(pred.squeeze(-1), target)
         _cuda_sync()
         t5 = time.perf_counter()

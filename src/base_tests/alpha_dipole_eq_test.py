@@ -2,15 +2,20 @@ import pytest
 import torch
 
 from src.se3_crossformer.se3_utils import RadialNetworkGSFB
-from src.qme14s_tests.train_qme14s import SE3PolarizabilityInterTransformer, SE3PolarizabilityIntraTransformer, SE3DeDipoleInterTransformer, SE3DeDipoleIntraTransformer
+from src.qme14s_tests.train_qme14s import SE3PolarizabilityIntraTransformer, SE3DeDipoleIntraTransformer
 
 torch.manual_seed(0)
 
 ATOL = 1e-8
 RTOL = 1e-8
 
-POLARIZABILITY_MODEL_CLASSES = [SE3PolarizabilityInterTransformer, SE3PolarizabilityIntraTransformer]
-DEDIPOLE_MODEL_CLASSES = [SE3DeDipoleInterTransformer, SE3DeDipoleIntraTransformer]
+POLARIZABILITY_MODEL_CLASSES = [SE3PolarizabilityIntraTransformer]
+DEDIPOLE_MODEL_CLASSES = [SE3DeDipoleIntraTransformer]
+
+# torch.randn(n_atoms, 3) toy positions are roughly unit-scale, so a small
+# radius_cutoff (vs. the 5.0 default meant for real Angstrom-scale molecules)
+# is what actually exercises the neighbor-list padding/masking logic.
+TEST_RADIUS_CUTOFF = 1.3
 
 
 def random_rotation_matrix(dtype=torch.double, generator=None) -> torch.Tensor:
@@ -23,7 +28,7 @@ def random_rotation_matrix(dtype=torch.double, generator=None) -> torch.Tensor:
     return Q.to(dtype)
 
 
-def make_toy_graph(n_atoms=12, n_atom_types=5, num_parts=4, seed=0):
+def make_toy_graph(n_atoms=12, n_atom_types=5, seed=0):
     g = torch.Generator().manual_seed(seed)
 
     x = torch.randn(n_atoms, 3, generator=g).double()
@@ -53,13 +58,13 @@ def make_toy_graph(n_atoms=12, n_atom_types=5, num_parts=4, seed=0):
     return node_features, x, edge_index, edge_attr, atomic_masses, batch
 
 
-def make_two_graph_batch(n_atom_types=5, num_parts=4, n_atoms_a=10, n_atoms_b=14,
+def make_two_graph_batch(n_atom_types=5, n_atoms_a=10, n_atoms_b=14,
                           seed_a=1, seed_b=2):
     nf_a, x_a, ei_a, ea_a, am_a, _ = make_toy_graph(
-        n_atoms=n_atoms_a, n_atom_types=n_atom_types, num_parts=num_parts, seed=seed_a
+        n_atoms=n_atoms_a, n_atom_types=n_atom_types, seed=seed_a
     )
     nf_b, x_b, ei_b, ea_b, am_b, _ = make_toy_graph(
-        n_atoms=n_atoms_b, n_atom_types=n_atom_types, num_parts=num_parts, seed=seed_b
+        n_atoms=n_atoms_b, n_atom_types=n_atom_types, seed=seed_b
     )
 
     node_features = torch.cat([nf_a, nf_b], dim=0)
@@ -74,16 +79,14 @@ def make_two_graph_batch(n_atom_types=5, num_parts=4, n_atoms_a=10, n_atoms_b=14
     return node_features, x, edge_index, edge_attr, atomic_masses, batch
 
 
-def build_model(model_cls, in_features, num_parts=4, max_degree=2):
+def build_model(model_cls, in_features, radius_cutoff=TEST_RADIUS_CUTOFF, max_degree=2):
     model = model_cls(
         radial_net=RadialNetworkGSFB,
         in_features=in_features,
         max_degree=max_degree,
-        num_layers=2,
         feature_dim=16,
         hidden_dim=32,
-        num_parts=num_parts,
-        partition_type="spectral",
+        radius_cutoff=radius_cutoff,
     )
     model.double().eval()
     return model
@@ -114,7 +117,7 @@ def assert_tensor_invariant(out_raw, out_tf):
 def test_polarizability_rotation_equivariance(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=42
+        n_atoms=12, n_atom_types=n_atom_types, seed=42
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -132,7 +135,7 @@ def test_polarizability_rotation_equivariance(model_cls):
 def test_polarizability_translation_invariance(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=7
+        n_atoms=12, n_atom_types=n_atom_types, seed=7
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -149,7 +152,7 @@ def test_polarizability_translation_invariance(model_cls):
 def test_polarizability_combined_rotation_and_translation(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=14, n_atom_types=n_atom_types, num_parts=4, seed=99
+        n_atoms=14, n_atom_types=n_atom_types, seed=99
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -167,7 +170,7 @@ def test_polarizability_combined_rotation_and_translation(model_cls):
 def test_polarizability_output_is_symmetric(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=13
+        n_atoms=12, n_atom_types=n_atom_types, seed=13
     )
     model = build_model(model_cls, in_features=n_atom_types)
     out = run(model, node_features, x, edge_index, edge_attr, atomic_masses, batch)
@@ -178,7 +181,7 @@ def test_polarizability_output_is_symmetric(model_cls):
 def test_polarizability_batched_combined_transform(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_two_graph_batch(
-        n_atom_types=n_atom_types, num_parts=4
+        n_atom_types=n_atom_types
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -197,7 +200,7 @@ def test_dedipole_rotation_equivariance(model_cls):
     n_atom_types = 5
     n_atoms = 12
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=n_atoms, n_atom_types=n_atom_types, num_parts=4, seed=42
+        n_atoms=n_atoms, n_atom_types=n_atom_types, seed=42
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -215,7 +218,7 @@ def test_dedipole_rotation_equivariance(model_cls):
 def test_dedipole_translation_invariance(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=12, n_atom_types=n_atom_types, num_parts=4, seed=7
+        n_atoms=12, n_atom_types=n_atom_types, seed=7
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -232,7 +235,7 @@ def test_dedipole_translation_invariance(model_cls):
 def test_dedipole_combined_rotation_and_translation(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_toy_graph(
-        n_atoms=14, n_atom_types=n_atom_types, num_parts=4, seed=99
+        n_atoms=14, n_atom_types=n_atom_types, seed=99
     )
     model = build_model(model_cls, in_features=n_atom_types)
 
@@ -250,7 +253,7 @@ def test_dedipole_combined_rotation_and_translation(model_cls):
 def test_dedipole_batched_combined_transform(model_cls):
     n_atom_types = 5
     node_features, x, edge_index, edge_attr, atomic_masses, batch = make_two_graph_batch(
-        n_atom_types=n_atom_types, num_parts=4
+        n_atom_types=n_atom_types
     )
     model = build_model(model_cls, in_features=n_atom_types)
 

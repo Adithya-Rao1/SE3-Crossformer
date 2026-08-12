@@ -31,7 +31,7 @@ def train_se3_cross(target, args, dry_run):
         "--epochs", str(args.epochs),
         "--batch_size", str(args.se3_cross_batch_size),
         "--accum_steps", str(args.se3_cross_accum_steps),
-        "--num_parts", str(args.num_parts),
+        "--radius_cutoff", str(args.radius_cutoff),
         "--data_root", args.data_root,
         "--metrics_dir", out_dir,
         "--device", args.device,
@@ -55,7 +55,7 @@ def train_se3_trans(target, args, dry_run):
         "--epochs", str(args.epochs),
         "--batch_size", str(args.se3_trans_batch_size),
         "--accum_steps", str(args.se3_trans_accum_steps),
-        "--min_nodes", str(args.num_parts),
+        "--min_nodes", str(args.min_nodes_baseline),
         "--data_root", args.data_root,
         "--checkpoint_dir", out_dir,
         "--checkpoint_template", checkpoint_template,
@@ -80,10 +80,12 @@ def main():
                          help="Number of trials (checkpoints) per (model, target). "
                               "Keep at 5 to match the 95%% CI sample size used downstream.")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--num_parts", type=int, default=4,
-                         help="Passed as --num_parts to the se3_cross model and --min_nodes "
-                              "to the se3_trans model, so both are trained/evaluated on the "
-                              "same set of molecules.")
+    parser.add_argument("--radius_cutoff", type=float, default=5.0,
+                         help="Passed as --radius_cutoff to the se3_cross model (no minimum "
+                              "atom count -- it forms neighborhoods purely by distance).")
+    parser.add_argument("--min_nodes_baseline", type=int, default=4,
+                         help="Passed as --min_nodes to the se3_trans baseline model, which "
+                              "does require a minimum atom count for its own partitioning.")
     parser.add_argument("--se3_cross_batch_size", type=int, default=32)
     parser.add_argument("--se3_cross_accum_steps", type=int, default=8)
     parser.add_argument("--se3_trans_batch_size", type=int, default=32)

@@ -25,7 +25,7 @@ def predict_se3_cross(target, args, dry_run):
         sys.executable, "-m", "src.tests.pred_custom",
         "--target", str(target),
         "--trials", str(args.trials),
-        "--num_parts", str(args.num_parts),
+        "--radius_cutoff", str(args.radius_cutoff),
         "--checkpoint_dir", ckpt_dir,
         "--data_root", args.data_root,
         "--out_dir", out_dir,
@@ -43,7 +43,7 @@ def predict_se3_trans(target, args, dry_run):
         sys.executable, "-m", "src.tests.pred_se3_orig",
         "--target", str(target),
         "--trials", str(args.trials),
-        "--min_nodes", str(args.num_parts),
+        "--min_nodes", str(args.min_nodes_baseline),
         "--checkpoint_dir", ckpt_dir,
         "--data_root", args.data_root,
         "--out_dir", out_dir,
@@ -61,9 +61,11 @@ def main():
     parser.add_argument("--models", type=str, nargs="+", default=["se3-cross", "se3-trans"],
                          choices=["se3-cross", "se3-trans"])
     parser.add_argument("--trials", type=int, default=5)
-    parser.add_argument("--num_parts", type=int, default=4,
-                         help="Must match what train_all_targets.py used, so both "
-                              "models are evaluated on the same set of molecules.")
+    parser.add_argument("--radius_cutoff", type=float, default=5.0,
+                         help="Must match the --radius_cutoff used to train the se3-cross model.")
+    parser.add_argument("--min_nodes_baseline", type=int, default=4,
+                         help="Must match the --min_nodes_baseline used to train the se3-trans "
+                              "baseline model (an actual constraint of its own partitioning).")
     parser.add_argument("--data_root", type=str, default="/home/ubuntu/se3-crossformer-data/data")
     parser.add_argument("--ckpt_root", type=str, default="./checkpoints",
                          help="Root passed as --out_root to train_all_targets.py.")

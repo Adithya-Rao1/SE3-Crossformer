@@ -8,24 +8,21 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-LAYERS = ["inter", "intra_only"]                
-PARTITION_TYPES = ["spectral", "knn"]        
-RBFS = ["grbf", "gsfb"]                  
+RADIUS_CUTOFFS = [3.0, 5.0, 7.0]
+RBFS = ["grbf", "gsfb"]
 
 @dataclass
 class AblationRun:
-    group: str            
-    swept_param: str     
-    partition_type: str
-    model_type: str
+    group: str
+    swept_param: str
+    radius_cutoff: float
     rbf_type: str
 
     @property
     def run_name(self) -> str:
         return (
             f"{self.group}"
-            f"__pt-{self.partition_type}"
-            f"__mt-{self.model_type}"
+            f"__rc-{self.radius_cutoff}"
             f"__rbf-{self.rbf_type}"
         )
 
@@ -33,21 +30,11 @@ class AblationRun:
 def build_ablation_plan() -> list:
     plan = []
 
-    for pt in PARTITION_TYPES:
+    for rc in RADIUS_CUTOFFS:
         plan.append(AblationRun(
             group="graph_construction",
-            swept_param=f"partition_type={pt}",
-            partition_type=pt,
-            model_type="inter",
-            rbf_type="gsfb",
-        ))
-
-    for mt in LAYERS:
-        plan.append(AblationRun(
-            group="model_architecture",
-            swept_param=f"model_type={mt}",
-            partition_type="spectral",
-            model_type=mt,
+            swept_param=f"radius_cutoff={rc}",
+            radius_cutoff=rc,
             rbf_type="gsfb",
         ))
 
@@ -55,8 +42,7 @@ def build_ablation_plan() -> list:
         plan.append(AblationRun(
             group="rbf",
             swept_param=f"rbf_type={rbf}",
-            partition_type="spectral",
-            model_type="inter",
+            radius_cutoff=5.0,
             rbf_type=rbf,
         ))
 
@@ -70,14 +56,11 @@ def build_command(run: AblationRun, args: argparse.Namespace, metrics_dir: str) 
     cmd = [
         sys.executable, "-m", args.train_script,
         "--target", str(args.target),
-        "--num_parts", str(args.num_parts),
+        "--radius_cutoff", str(run.radius_cutoff),
         "--max_degree", str(args.max_degree),
         "--batch_size", str(args.batch_size),
         "--accum_steps", str(args.accum_steps),
-        "--partition_type", run.partition_type,
-        "--model_type", run.model_type,
         "--rbf_type", run.rbf_type,
-        "--num_layers", str(args.num_layers),
         "--feature_dim", str(args.feature_dim),
         "--hidden_dim", str(args.hidden_dim),
         "--lr", str(args.lr),
@@ -105,15 +88,14 @@ def run_single_ablation(run: AblationRun, args: argparse.Namespace) -> dict:
     log_path = os.path.join(metrics_dir, "run.log")
 
     print(f"\n{'=' * 80}\n[{run.group}] {run.swept_param}\n"
-          f"  partition_type={run.partition_type}  model_type={run.model_type}  "
+          f"  radius_cutoff={run.radius_cutoff}  "
           f"rbf_type={run.rbf_type}\n  metrics_dir={metrics_dir}\n"
           f"  cmd: {' '.join(cmd)}\n{'=' * 80}")
 
     result_row = {
         "group": run.group,
         "swept_param": run.swept_param,
-        "partition_type": run.partition_type,
-        "model_type": run.model_type,
+        "radius_cutoff": run.radius_cutoff,
         "rbf_type": run.rbf_type,
         "metrics_dir": metrics_dir,
         "returncode": None,
@@ -161,7 +143,7 @@ def run_single_ablation(run: AblationRun, args: argparse.Namespace) -> dict:
 
 def write_summary_csv(rows: list, path: str):
     fieldnames = [
-        "group", "swept_param", "partition_type", "model_type", "rbf_type",
+        "group", "swept_param", "radius_cutoff", "rbf_type",
         "metrics_dir", "returncode", "test_mae", "test_mae_ci95",
         "wall_time_sec", "status",
     ]
@@ -175,19 +157,17 @@ def write_summary_csv(rows: list, path: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SE3 transformer ablation sweeps.")
 
-    parser.add_argument("--train_script", type=str, default="src.train",
+    parser.add_argument("--train_script", type=str, default="src.qm9_tests.train",
                          help="Path to train.py entry point.")
     parser.add_argument("--groups", type=str, nargs="+",
-                         default=["graph_construction", "model_architecture", "rbf"],
-                         choices=["graph_construction", "model_architecture", "rbf"],
+                         default=["graph_construction", "rbf"],
+                         choices=["graph_construction", "rbf"],
                          help="Which ablation groups to run, in order.")
 
     parser.add_argument("--target", type=int, default=1)
-    parser.add_argument("--num_parts", type=int, default=4)
     parser.add_argument("--max_degree", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--accum_steps", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -235,8 +215,7 @@ def main():
                   f"Continuing to next run.")
             row = {
                 "group": run.group, "swept_param": run.swept_param,
-                "partition_type": run.partition_type, "model_type": run.model_type,
-                "rbf_type": run.rbf_type,
+                "radius_cutoff": run.radius_cutoff, "rbf_type": run.rbf_type,
                 "metrics_dir": os.path.join(args.base_metrics_dir, run.group, run.run_name),
                 "returncode": None, "test_mae": None, "test_mae_ci95": None,
                 "wall_time_sec": None, "status": f"error: {e!r}",

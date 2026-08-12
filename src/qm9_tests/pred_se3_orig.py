@@ -127,9 +127,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", type=int, default=1)
     parser.add_argument("--min_nodes", type=int, default=4,
-                         help="Drop graphs with fewer atoms than this. Set equal to "
-                              "the custom model's --num_parts for an apples-to-apples "
-                              "comparison over the same molecules.")
+                         help="Drop graphs with fewer atoms than this -- a real constraint "
+                              "of this baseline model's own partitioning (the custom "
+                              "se3-cross model has no such minimum under radius-cutoff "
+                              "neighborhoods).")
     parser.add_argument("--batch_size", type=int, default=16,
                          help="Dense (b, n, n) edge tensors are memory-heavy; "
                               "keep this smaller than the custom model's batch size.")

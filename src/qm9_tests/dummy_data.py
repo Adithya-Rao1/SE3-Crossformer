@@ -7,7 +7,13 @@ BOND_ORDERS = [1.0, 1.5, 2.0, 3.0]
 NUM_TARGETS = 16  # mu, alpha, homo, lumo, gap, r2, zpve, u0, u298, h298, g298, cv, u0_atom, u298_atom, h298_atom, g298_atom
 
 
-def _make_dummy_molecule(num_atoms, generator):
+def _bond_onehot(idx):
+    onehot = [0.0] * len(BOND_ORDERS)
+    onehot[idx] = 1.0
+    return onehot
+
+
+def _make_dummy_molecule(num_atoms, generator, mol_idx=0):
     atom_idx = torch.randint(0, len(ATOM_TYPES), (num_atoms,), generator=generator)
     z = torch.tensor([ATOM_TYPES[i] for i in atom_idx.tolist()], dtype=torch.float)
     pos = torch.randn(num_atoms, 3, generator=generator)
@@ -17,33 +23,36 @@ def _make_dummy_molecule(num_atoms, generator):
     for k in range(1, num_atoms):
         child = perm[k].item()
         parent = perm[torch.randint(0, k, (1,), generator=generator).item()].item()
-        bond_order = BOND_ORDERS[torch.randint(0, len(BOND_ORDERS), (1,), generator=generator).item()]
+        bond_idx = torch.randint(0, len(BOND_ORDERS), (1,), generator=generator).item()
         rows.extend([child, parent])
         cols.extend([parent, child])
-        edge_features.extend([[bond_order], [bond_order]])
+        edge_features.extend([_bond_onehot(bond_idx), _bond_onehot(bond_idx)])
 
     num_extra = max(0, num_atoms // 3)
     for _ in range(num_extra):
         i, j = torch.randint(0, num_atoms, (2,), generator=generator).tolist()
         if i == j:
             continue
-        bond_order = BOND_ORDERS[torch.randint(0, len(BOND_ORDERS), (1,), generator=generator).item()]
+        bond_idx = torch.randint(0, len(BOND_ORDERS), (1,), generator=generator).item()
         rows.extend([i, j])
         cols.extend([j, i])
-        edge_features.extend([[bond_order], [bond_order]])
+        edge_features.extend([_bond_onehot(bond_idx), _bond_onehot(bond_idx)])
 
     edge_index = torch.tensor([rows, cols], dtype=torch.long)
     edge_attr = torch.tensor(edge_features, dtype=torch.float)
     y = torch.randn(1, NUM_TARGETS, generator=generator)
 
-    return Data(x=z, edge_index=edge_index, edge_attr=edge_attr, pos=pos, y=y)
+    return Data(
+        x=z, edge_index=edge_index, edge_attr=edge_attr, pos=pos, y=y,
+        idx=torch.tensor([mol_idx]),
+    )
 
 
 def _make_dummy_dataset(num_molecules, generator, min_atoms=6, max_atoms=15):
     data_list = []
-    for _ in range(num_molecules):
+    for mol_idx in range(num_molecules):
         num_atoms = torch.randint(min_atoms, max_atoms + 1, (1,), generator=generator).item()
-        data_list.append(_make_dummy_molecule(num_atoms, generator))
+        data_list.append(_make_dummy_molecule(num_atoms, generator, mol_idx=mol_idx))
     return data_list
 
 

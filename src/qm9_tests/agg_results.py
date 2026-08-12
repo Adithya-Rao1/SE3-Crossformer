@@ -13,7 +13,7 @@ TARGET_NAMES = {
     0: "mu", 1: "alpha", 2: "homo", 3: "lumo", 4: "gap",
     5: "R2", 6: "zpve", 7: "U0", 8: "U", 9: "H", 10: "G", 11: "Cv",
 }
-MODEL_LABELS = {"se3-cross": "SE3InterNeighborhoodTransformer", "se3-trans": "se3-transformer-pytorch"}
+MODEL_LABELS = {"se3-cross": "SE3IntraOnlyTransformer", "se3-trans": "se3-transformer-pytorch"}
 
 
 def load_summary(pred_root, model, target):

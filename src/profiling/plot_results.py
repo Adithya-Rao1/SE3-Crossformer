@@ -177,28 +177,20 @@ def _plot_batch_scaling(data: Dict, plot_dir: Path, name: str):
 
 
 def _plot_graph_construction(data: Dict, plot_dir: Path, name: str):
-    """Experiment 8 & 12: graph build sub-steps vs forward time."""
+    """Experiment 8 & 12: radius-neighbor graph build vs forward time."""
     n = len(data["total_graph_build_times_s"])
     x = list(range(1, n + 1))
 
-    spec = np.array(data["spectral_partition_times_s"]) * 1e3
-    com  = np.array(data["center_of_mass_times_s"])     * 1e3
-    nbr  = np.array(data["neighbor_build_times_s"])     * 1e3
     tot  = np.array(data["total_graph_build_times_s"])  * 1e3
     fwd  = np.array(data["forward_times_s"])            * 1e3
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     ax = axes[0]
-    ax.stackplot(
-        x, spec, com, nbr,
-        labels=["spectral_partition", "center_of_mass", "neighbor_build"],
-        alpha=0.85,
-    )
+    ax.plot(x, tot, color=COLOURS["h2d"], linewidth=2)
     ax.set_xlabel("Batch index")
     ax.set_ylabel("Time (ms)")
-    ax.set_title("Graph construction sub-step times (stacked)")
-    ax.legend(fontsize=8)
+    ax.set_title("Radius-neighbor graph build time")
 
     ax2 = axes[1]
     ax2.plot(x, tot, label="Total build", color=COLOURS["h2d"],     linewidth=2)
